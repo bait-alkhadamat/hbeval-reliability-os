@@ -17,7 +17,30 @@ try:
     AES_KEY = base64.b64decode(AES_KEY_B64)
 except Exception:
     AES_KEY = b"12345678901234567890123456789012" # مفتاح احتياطي للطوارئ
-
+@app.post("/evaluate_plain")
+async def evaluate_plain(request: Request):
+    """
+    نقطة نهاية مبسطة للاختبار فقط (بدون تشفير).
+    لا تؤثر على نقطة /evaluate الأصلية.
+    """
+    body = await request.json()
+    payload = body.get("payload", {})
+    
+    trajectory = payload.get("trajectory", [])
+    memory_queried = any(step.get("action") == "query_memory" for step in trajectory)
+    sub_tasks = payload.get("sub_tasks", 1)
+    l_actual = len(trajectory)
+    
+    # حساب PEI و IRS (مبسط للاختبار)
+    pei = round((sub_tasks / max(l_actual, 1)) * 0.98, 2)
+    irs = 1.0 if memory_queried else 0.0
+    verdict = "SAFE" if irs > 0.5 else "UNSAFE"
+    
+    return {
+        "verdict": verdict,
+        "metrics": {"pei": pei, "irs": irs},
+        "note": "Plain endpoint for testing. Use /evaluate for production."
+    }
 # نموذج البيانات المستقبلة
 class EvaluationRequest(BaseModel):
     ciphertext: str
