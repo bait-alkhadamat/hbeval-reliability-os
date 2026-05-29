@@ -10,8 +10,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 app = FastAPI(title="HB-Eval Reliability OS")
 
 # إعداد المفاتيح (تم وضع مفاتيح الاختبار كقيمة افتراضية لضمان عملها فوراً)
-API_KEY = os.getenv("API_KEY", "hb_prod_123456789")
-AES_KEY_B64 = os.getenv("AES_KEY", "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=")
+API_KEY = os.getenv("API_KEY", "hb_prod_132182Q")
+AES_KEY_B64 = os.getenv("AES_KEY", "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODGASIM")
 
 try:
     AES_KEY = base64.b64decode(AES_KEY_B64)
