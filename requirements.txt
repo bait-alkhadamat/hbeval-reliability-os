@@ -5,3 +5,4 @@ sentence-transformers
 redis
 cryptography
 requests
+pydantic
