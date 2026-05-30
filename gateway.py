@@ -15,7 +15,7 @@ app = FastAPI(title="HB-Eval Reliability OS", version="2.0.0")
 
 # ---------- Environment variables ----------
 API_KEY = os.getenv("API_KEY", "hb_prod_132182Q")
-AES_KEY_B64 = os.getenv("AES_KEY", "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODGASIM")
+AES_KEY_B64 = os.getenv("AES_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVm")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
