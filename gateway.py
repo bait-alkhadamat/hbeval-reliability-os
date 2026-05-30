@@ -10,25 +10,21 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from supabase import create_client, Client
 from engines import HBEvalEngines
 
-# ========== 1. تهيئة التطبيق ==========
-app = FastAPI(title="HB-Eval Reliability OS", version="1.0.0")
+# ---------- App initialization ----------
+app = FastAPI(title="HB-Eval Reliability OS", version="2.0.0")
 
-# ========== 2. قراءة المتغيرات البيئية ==========
+# ---------- Environment variables ----------
 API_KEY = os.getenv("API_KEY", "hb_prod_132182Q")
 AES_KEY_B64 = os.getenv("AES_KEY", "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODGASIM")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-USE_OPENAI_EMBEDDINGS = os.getenv("USE_OPENAI_EMBEDDINGS", "false").lower() == "true"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
-# ========== 3. إعداد مفتاح AES ==========
 try:
     AES_KEY = base64.b64decode(AES_KEY_B64)
 except Exception:
     AES_KEY = b"12345678901234567890123456789012"
 
-# ========== 4. الاتصال بـ Supabase ==========
+# ---------- Supabase client ----------
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -36,74 +32,52 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     print("⚠️ Supabase not configured – storage disabled")
 
-# ========== 5. نموذج البيانات المستلمة للتقييم المشفر ==========
-class EvaluationRequest(BaseModel):
-    ciphertext: str
-
-# ========== 6. Lazy loading for embeddings model ==========
+# ---------- Embeddings (lazy load for EDM) ----------
 _embedding_model = None
-_embedding_model_loaded = False
-
 def get_embedding_model():
-    global _embedding_model, _embedding_model_loaded
-    if _embedding_model_loaded:
-        return _embedding_model
-    
-    if USE_OPENAI_EMBEDDINGS:
-        if not OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY not set but USE_OPENAI_EMBEDDINGS=true")
-        print("✅ Using OpenAI embeddings")
-        _embedding_model_loaded = True
-        return "openai"
-    else:
-        try:
-            from sentence_transformers import SentenceTransformer
-            _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-            print("✅ Local SentenceTransformer loaded")
-            _embedding_model_loaded = True
-            return _embedding_model
-        except ImportError:
-            raise RuntimeError("sentence-transformers not installed. Run: pip install sentence-transformers")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load local embedding model: {e}")
+    global _embedding_model
+    if _embedding_model is None:
+        from sentence_transformers import SentenceTransformer
+        _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    return _embedding_model
 
-def generate_embedding(text: str):
-    model = get_embedding_model()
-    if model == "openai":
-        import requests
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        data = {
-            "model": OPENAI_EMBEDDING_MODEL,
-            "input": text
-        }
-        resp = requests.post("https://api.openai.com/v1/embeddings", json=data, headers=headers, timeout=10)
-        resp.raise_for_status()
-        return resp.json()["data"][0]["embedding"]
-    else:
-        return model.encode(text).tolist()
+# ---------- CSI helper ----------
+def get_csi_for_agent(project_id: str, agent_id: str = None):
+    query = supabase.table("evaluations").select("pei_score, irs_score, verdict").eq("project_id", project_id)
+    if agent_id:
+        query = query.eq("agent_id", agent_id)
+    query = query.order("created_at", desc=True).limit(100)
+    evals = query.execute().data
+    evals_reversed = list(reversed(evals))
+    return HBEvalEngines.calculate_csi_from_history(evals_reversed)
 
-# ========== 7. تخزين التقييم في Supabase و EDM ==========
-def store_evaluation_and_edm(project_id: str, trajectory: list, pei: float, irs: float, verdict: str, context: str):
+# ---------- Store evaluation and EDM ----------
+def store_evaluation_and_edm(project_id: str, agent_id: str, trajectory: list,
+                             pei: float, irs: float, verdict: str, context: str,
+                             frr: float = 1.0, ti: float = 4.0):
     if not supabase:
         return
     trajectory_hash = hashlib.sha256(json.dumps(trajectory).encode()).hexdigest()
-    # insert evaluation
+    # Calculate CSI from existing history
+    csi = get_csi_for_agent(project_id, agent_id)
+    # Insert evaluation
     supabase.table("evaluations").insert({
         "project_id": project_id,
+        "agent_id": agent_id,
         "trajectory_hash": trajectory_hash,
         "pei_score": pei,
         "irs_score": irs,
+        "csi_score": csi,
+        "frr_score": frr,
+        "ti_score": ti,
         "verdict": verdict,
         "created_at": datetime.utcnow().isoformat()
     }).execute()
-    
-    # Store in EDM if high quality
+    # Update agent passport (if exists, otherwise create later)
+    # Store in EDM only if high quality
     if pei >= 0.8 and irs >= 0.6:
         try:
-            embedding = generate_embedding(context)
+            embedding = get_embedding_model().encode(context).tolist()
             supabase.table("edm_memory").insert({
                 "project_id": project_id,
                 "fault_context": context,
@@ -114,93 +88,97 @@ def store_evaluation_and_edm(project_id: str, trajectory: list, pei: float, irs:
             }).execute()
             print(f"🧠 Stored in EDM: PEI={pei}, IRS={irs}")
         except Exception as e:
-            print(f"⚠️ Failed to store EDM: {e}")
+            print(f"⚠️ EDM storage failed: {e}")
 
-# ========== 8. نقطة فحص الصحة ==========
+# ---------- Model for encrypted request ----------
+class EvaluationRequest(BaseModel):
+    ciphertext: str
+
+# ---------- Health check ----------
 @app.get("/health")
 def health_check():
     return {"status": "ok", "message": "HB-Eval Gateway is online and secure."}
 
-# ========== 9. نقطة التقييم المبسطة (بدون تشفير) ==========
+# ---------- Plain evaluation (testing) ----------
 @app.post("/evaluate_plain")
 async def evaluate_plain(request: Request):
     body = await request.json()
     payload = body.get("payload", {})
-    
     trajectory = payload.get("trajectory", [])
     sub_tasks = payload.get("sub_tasks", 1)
-    l_actual = len(trajectory)
-    l_min = sub_tasks
     violations = payload.get("constraint_violations", 0)
     memory_queried = any(step.get("action") == "query_memory" for step in trajectory)
     recovery_attempts = payload.get("recovery_attempts", 0)
     context = payload.get("context", "General execution")
+    agent_id = payload.get("agent_id", "unknown-agent")
     
-    pei = HBEvalEngines.calculate_pei(l_min, l_actual, violations)
+    pei = HBEvalEngines.calculate_pei(sub_tasks, len(trajectory), violations)
     irs = HBEvalEngines.calculate_irs(memory_queried, recovery_attempts)
     verdict = "SAFE" if (pei >= 0.7 and irs >= 0.6) else "UNSAFE"
     
-    # تخزين
-    store_evaluation_and_edm("00000000-0000-0000-0000-000000000001", trajectory, pei, irs, verdict, context)
+    project_id = "00000000-0000-0000-0000-000000000001"  # TODO: fetch from API key
+    store_evaluation_and_edm(project_id, agent_id, trajectory, pei, irs, verdict, context)
     
     return {
         "verdict": verdict,
         "metrics": {"pei": pei, "irs": irs},
-        "note": "Full evaluation with storage (plain endpoint)"
+        "note": "Plain evaluation with storage"
     }
 
-# ========== 10. نقطة التقييم المشفرة (للإنتاج) ==========
+# ---------- Encrypted evaluation (production) ----------
 @app.post("/evaluate")
-async def evaluate_agent_action(
+async def evaluate_encrypted(
     request: EvaluationRequest,
     authorization: str = Header(None),
     x_hbeval_nonce: str = Header(None),
     x_hbeval_timestamp: str = Header(None),
     x_hbeval_signature: str = Header(None)
 ):
-    # التحقق من الرؤوس الأمنية
+    # 1. Validate headers
     if not all([authorization, x_hbeval_nonce, x_hbeval_timestamp, x_hbeval_signature]):
         raise HTTPException(status_code=400, detail="Missing security headers")
     
+    # 2. API Key check
     token = authorization.replace("Bearer ", "")
     if token != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
     
-    expected_signature = hmac.new(
+    # 3. HMAC verification (simplified – add full logic)
+    expected_sig = hmac.new(
         hashlib.sha256(API_KEY.encode()).digest(),
         f"{x_hbeval_timestamp}.{x_hbeval_nonce}".encode(),
         hashlib.sha256
     ).hexdigest()
-    if not hmac.compare_digest(x_hbeval_signature, expected_signature):
-        raise HTTPException(status_code=401, detail="Invalid Signature")
+    if not hmac.compare_digest(x_hbeval_signature, expected_sig):
+        raise HTTPException(status_code=401, detail="Invalid signature")
     
-    # فك التشفير
+    # 4. Decrypt
     try:
         aesgcm = AESGCM(AES_KEY)
-        decrypted_data = aesgcm.decrypt(
+        decrypted = aesgcm.decrypt(
             x_hbeval_nonce.encode(),
             bytes.fromhex(request.ciphertext),
             None
         )
-        payload = json.loads(decrypted_data.decode())
+        payload = json.loads(decrypted.decode())
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Decryption failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Decryption failed: {e}")
     
-    # نفس منطق التقييم
+    # 5. Evaluate
     trajectory = payload.get("trajectory", [])
     sub_tasks = payload.get("sub_tasks", 1)
-    l_actual = len(trajectory)
-    l_min = sub_tasks
     violations = payload.get("constraint_violations", 0)
     memory_queried = any(step.get("action") == "query_memory" for step in trajectory)
     recovery_attempts = payload.get("recovery_attempts", 0)
     context = payload.get("context", "General execution")
+    agent_id = payload.get("agent_id", "unknown-agent")
     
-    pei = HBEvalEngines.calculate_pei(l_min, l_actual, violations)
+    pei = HBEvalEngines.calculate_pei(sub_tasks, len(trajectory), violations)
     irs = HBEvalEngines.calculate_irs(memory_queried, recovery_attempts)
     verdict = "SAFE" if (pei >= 0.7 and irs >= 0.6) else "UNSAFE"
     
-    store_evaluation_and_edm("00000000-0000-0000-0000-000000000001", trajectory, pei, irs, verdict, context)
+    project_id = "00000000-0000-0000-0000-000000000001"
+    store_evaluation_and_edm(project_id, agent_id, trajectory, pei, irs, verdict, context)
     
     return {
         "status": "success",
@@ -208,18 +186,16 @@ async def evaluate_agent_action(
         "metrics": {"pei": pei, "irs": irs}
     }
 
-# ========== 11. نقطة استرجاع الذاكرة الدلالية ==========
+# ---------- Memory retrieval (semantic) ----------
 @app.post("/api/v1/memory/retrieve")
 async def retrieve_memory(request: Request):
-    body = await request.json()
-    context = body.get("context", "")
-    project_id = body.get("project_id", "00000000-0000-0000-0000-000000000001")
-    
     if not supabase:
         raise HTTPException(status_code=503, detail="Supabase not configured")
-    
+    body = await request.json()
+    context = body.get("context")
+    project_id = body.get("project_id", "00000000-0000-0000-0000-000000000001")
     try:
-        query_vec = generate_embedding(context)
+        query_vec = get_embedding_model().encode(context).tolist()
         response = supabase.rpc("match_edm_memory", {
             "query_embedding": query_vec,
             "match_threshold": 0.75,
@@ -228,4 +204,21 @@ async def retrieve_memory(request: Request):
         }).execute()
         return {"status": "success", "matches": response.data}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Retrieval failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Retrieval error: {e}")
+
+# ---------- Agent Passport endpoint ----------
+@app.get("/api/v1/agent/{agent_id}")
+def get_agent_passport(agent_id: str):
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    result = supabase.table("agent_passports").select("*").eq("agent_id", agent_id).execute()
+    if not result.data:
+        # Create minimal record
+        supabase.table("agent_passports").insert({
+            "agent_id": agent_id,
+            "developer_name": "unknown",
+            "version": "0.0.0",
+            "certification_status": "unverified"
+        }).execute()
+        return {"agent_id": agent_id, "status": "new"}
+    return result.data[0]
