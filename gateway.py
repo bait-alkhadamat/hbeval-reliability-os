@@ -14,8 +14,9 @@ from engines import HBEvalEngines
 app = FastAPI(title="HB-Eval Reliability OS", version="2.0.0")
 
 # ---------- Environment variables ----------
+# إعداد المفاتيح (تم وضع مفاتيح الاختبار كقيمة افتراضية لضمان عملها فوراً)
 API_KEY = os.getenv("API_KEY", "hb_prod_132182Q")
-AES_KEY_B64 = os.getenv("AES_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVm")
+AES_KEY_B64 = os.getenv("AES_KEY", "ribUleLD81UmgG0tNBWijC0P2OPx6zRPBTrwvavE/kI=")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
