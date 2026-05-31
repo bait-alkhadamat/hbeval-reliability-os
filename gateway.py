@@ -9,9 +9,9 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from supabase import create_client, Client
 from engines import HBEvalEngines
 
-app = FastAPI(title="HB-Eval Reliability OS", version="4.0.0")
+app = FastAPI(title="HB-Eval Reliability OS", version="3.0.0")
 
-# ========== البيئة والمفاتيح ==========
+# ========== 1. قراءة المتغيرات البيئية ==========
 API_KEY = os.getenv("API_KEY", "hb_prod_132182Q")
 AES_KEY_B64 = os.getenv("AES_KEY", "ribUleLD81UmgG0tNBWijC0P2OPx6zRPBTrwvavE/kI=")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -22,49 +22,65 @@ try:
 except Exception:
     AES_KEY = b"12345678901234567890123456789012"
 
-# ========== Supabase ==========
+# ========== 2. الاتصال بـ Supabase ==========
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    print("✅ Supabase connected")
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✅ Supabase connected")
+    except Exception as e:
+        print(f"⚠️ Supabase connection failed: {e}")
 else:
     print("⚠️ Supabase not configured – storage disabled")
 
 engines = HBEvalEngines()
 
-# ========== دوال مساعدة ==========
-def get_csi_for_project(project_id: str):
+# ========== 3. دوال مساعدة ==========
+def get_project_id_from_api_key(api_key: str) -> str:
+    """جلب project_id من جدول projects باستخدام api_key"""
+    if not supabase:
+        return "00000000-0000-0000-0000-000000000001"
+    try:
+        result = supabase.table("projects").select("id").eq("api_key", api_key).execute()
+        if result.data and len(result.data) > 0:
+            return result.data[0]["id"]
+    except Exception as e:
+        print(f"⚠️ Failed to fetch project_id: {e}")
+    return "00000000-0000-0000-0000-000000000001"
+
+def get_evaluation_history(project_id: str, agent_id: str = None, limit: int = 100) -> list:
     """استرجاع آخر التقييمات لحساب CSI"""
     if not supabase:
-        return 0.5
+        return []
     try:
-        response = supabase.table("evaluations")\
-            .select("pei_score, irs_score, verdict")\
-            .eq("project_id", project_id)\
-            .order("created_at", desc=True)\
-            .limit(100)\
-            .execute()
-        evals = response.data
-        evals_reversed = list(reversed(evals))
-        return engines.calculate_csi_from_history(evals_reversed)
+        query = supabase.table("evaluations").select("pei_score, irs_score, verdict").eq("project_id", project_id)
+        if agent_id:
+            query = query.eq("agent_id", agent_id)
+        query = query.order("created_at", desc=True).limit(limit)
+        result = query.execute()
+        # نرجعها بالترتيب التصاعدي لحساب الاتجاه
+        return list(reversed(result.data))
     except Exception as e:
-        print(f"⚠️ Could not fetch history for CSI: {e}")
-        return 0.5
+        print(f"⚠️ Failed to fetch history: {e}")
+        return []
 
 def store_evaluation_and_edm(project_id: str, agent_id: str, trajectory: list,
                              pei: float, irs: float, verdict: str, context: str,
-                             total_faults: int = 0, successful_recoveries: int = 0):
+                             total_faults: int, successful_recoveries: int):
+    """تخزين التقييم والذاكرة الانتقاعية مع جميع المقاييس"""
     if not supabase:
+        print("⚠️ Supabase not configured – skipping storage")
         return
     
     trajectory_hash = hashlib.sha256(json.dumps(trajectory).encode()).hexdigest()
     
-    # حساب المقاييس الإضافية
+    # حساب FRR, CSI, TI
     frr = engines.calculate_frr(total_faults, successful_recoveries)
-    csi = get_csi_for_project(project_id)  # من التاريخ الحالي
+    history = get_evaluation_history(project_id, agent_id)
+    csi = engines.calculate_csi_from_history(history)
     ti = engines.calculate_ti(trajectory)
     
-    # تخزين التقييم الكامل
+    # 1. إدراج التقييم في جدول evaluations
     try:
         supabase.table("evaluations").insert({
             "project_id": project_id,
@@ -72,24 +88,26 @@ def store_evaluation_and_edm(project_id: str, agent_id: str, trajectory: list,
             "trajectory_hash": trajectory_hash,
             "pei_score": pei,
             "irs_score": irs,
-            "frr_score": frr,
             "csi_score": csi,
+            "frr_score": frr,
             "ti_score": ti,
             "verdict": verdict,
             "created_at": datetime.utcnow().isoformat()
         }).execute()
-        print(f"📝 Stored: PEI={pei}, IRS={irs}, FRR={frr}, CSI={csi}, TI={ti}, verdict={verdict}")
+        print(f"📝 Evaluation stored: PEI={pei}, IRS={irs}, CSI={csi}, FRR={frr}, TI={ti}, verdict={verdict}")
     except Exception as e:
         print(f"⚠️ Failed to store evaluation: {e}")
-        return
     
-    # تخزين في EDM إذا كانت النجاحات ممتازة
+    # 2. تخزين في الذاكرة الانتقاعية إذا كان الأداء ممتازاً
     if pei >= 0.8 and irs >= 0.6:
         try:
+            # Embedding بسيط (نص عادي – لاحقاً يمكن استخدام نموذج حقيقي)
+            embedding = [0.0] * 384  # موقت – سيتم استبداله بـ embedding حقيقي لاحقاً
             supabase.table("edm_memory").insert({
                 "project_id": project_id,
                 "fault_context": context,
                 "trajectory_summary": json.dumps(trajectory),
+                "embedding": embedding,
                 "pei_score": pei,
                 "irs_score": irs
             }).execute()
@@ -97,10 +115,10 @@ def store_evaluation_and_edm(project_id: str, agent_id: str, trajectory: list,
         except Exception as e:
             print(f"⚠️ Failed to store EDM: {e}")
 
-# ========== نقاط النهاية ==========
+# ========== 4. نقاط النهاية (Endpoints) ==========
 @app.get("/health")
 def health():
-    return {"status": "ok", "message": "HB-Eval Gateway (Full Metrics)"}
+    return {"status": "ok", "message": "HB-Eval Gateway (Full Mode)"}
 
 @app.post("/evaluate")
 async def evaluate(
@@ -113,17 +131,18 @@ async def evaluate(
     # 1. التحقق من الرؤوس
     if not all([authorization, x_hbeval_nonce, x_hbeval_timestamp, x_hbeval_signature]):
         raise HTTPException(400, "Missing security headers")
+    
     token = authorization.replace("Bearer ", "")
     if token != API_KEY:
         raise HTTPException(401, "Invalid API Key")
     
     # 2. التحقق من HMAC
-    expected_sig = hmac.new(
+    expected = hmac.new(
         hashlib.sha256(API_KEY.encode()).digest(),
         f"{x_hbeval_timestamp}.{x_hbeval_nonce}".encode(),
         hashlib.sha256
     ).hexdigest()
-    if not hmac.compare_digest(x_hbeval_signature, expected_sig):
+    if not hmac.compare_digest(expected, x_hbeval_signature):
         raise HTTPException(401, "Invalid Signature")
     
     # 3. فك التشفير
@@ -149,29 +168,31 @@ async def evaluate(
     memory_queried = any(step.get("action") == "query_memory" for step in trajectory)
     recovery_attempts = payload.get("recovery_attempts", 0)
     context = payload.get("context", "General")
-    agent_id = payload.get("agent_id", "unknown")
+    agent_id = payload.get("agent_id", "unknown-agent")
     total_faults = payload.get("total_faults", 0)
     successful_recoveries = payload.get("successful_recoveries", 0)
     
-    # 5. حساب المقاييس الرئيسية
+    # 5. حساب المقاييس
     l_actual = len(trajectory)
     l_min = max(1, sub_tasks)
     pei = engines.calculate_pei(l_min, l_actual, violations)
     irs = engines.calculate_irs(memory_queried, recovery_attempts)
     verdict = "SAFE" if (pei >= 0.7 and irs >= 0.6) else "UNSAFE"
     
-    # 6. التخزين (project_id ثابت حالياً)
-    project_id = "00000000-0000-0000-0000-000000000001"
+    # 6. الحصول على project_id الصحيح
+    project_id = get_project_id_from_api_key(API_KEY)
+    
+    # 7. التخزين في الخلفية (لا يعطل الاستجابة)
     store_evaluation_and_edm(
         project_id, agent_id, trajectory, pei, irs, verdict, context,
         total_faults, successful_recoveries
     )
     
+    # 8. الرد
     return {
         "verdict": verdict,
         "metrics": {
             "pei": pei,
             "irs": irs
-            # يمكن إضافة المزيد لاحقاً إذا أردت إرجاعها للعميل
         }
     }
