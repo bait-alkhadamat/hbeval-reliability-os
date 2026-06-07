@@ -1,26 +1,26 @@
-# HB-Eval OS Gateway — Python dependencies
-# ==========================================
-# Versions are pinned to minor releases (e.g. >=2.0,<3)
-# rather than exact versions to allow security patches while
-# preventing breaking API changes.
-#
-# After any version update, test locally before pushing to Railway:
-#   pip install -r requirements.txt
-#   uvicorn gateway:app --reload
+# HB-Eval OS Gateway — Python dependencies (v2.1.0)
+# ==================================================
+# fastapi-limiter is PINNED to an exact version. This is the single line that
+# was blocking Railway deployment: a loose range (>=0.1.6,<1) allowed pip to
+# install a version whose internal API did not match the code's calls, so the
+# container crashed on startup before serving anything. Pinning it exactly
+# removes that failure. After any future change here, test locally first:
+#     pip install -r requirements.txt
+#     uvicorn gateway:app --reload
 
 # ── Web framework ──────────────────────────────────────────────────────────
 fastapi>=0.111,<1
-uvicorn[standard]>=0.30,<1      # includes websockets and httptools for speed
+uvicorn[standard]>=0.30,<1
 
-# ── Rate limiting ──────────────────────────────────────────────────────────
-fastapi-limiter>=0.1.6,<1       # Redis-backed rate limiting for FastAPI
-redis[asyncio]>=5.0,<6          # async Redis client (used by fastapi-limiter)
+# ── Rate limiting (PINNED — see note above) ────────────────────────────────
+fastapi-limiter==0.1.6
+redis[asyncio]>=5.0,<6
 
 # ── Cryptography ───────────────────────────────────────────────────────────
-cryptography>=42,<43            # AES-256-GCM via AESGCM
+cryptography>=42,<44
 
 # ── Database ───────────────────────────────────────────────────────────────
-supabase>=2.4,<3                # Supabase Python client (sync, wrapped in asyncio.to_thread)
+supabase>=2.4,<3
 
 # ── Data validation ────────────────────────────────────────────────────────
-pydantic>=2.6,<3                # Request/response model validation (FastAPI default)
+pydantic>=2.6,<3
