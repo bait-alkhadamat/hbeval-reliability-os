@@ -20,6 +20,12 @@ class ValidationError(Exception):
 
 
 MAX_AGENT_ID_LENGTH = 128
+# DoS protection: cap the work a single request can demand. These bounds are
+# generous for real agents but stop a malicious payload from exhausting memory
+# or CPU. Enforced server-side before any computation.
+MAX_TRAJECTORY_STEPS = 10_000
+MAX_RECOVERY_EPISODES = 1_000
+MAX_SUB_TASKS = 100_000
 
 
 def validate_payload(payload: dict[str, Any]) -> None:
@@ -29,12 +35,16 @@ def validate_payload(payload: dict[str, Any]) -> None:
     trajectory = payload.get("trajectory")
     if not isinstance(trajectory, list) or len(trajectory) == 0:
         raise ValidationError("Field 'trajectory' is required and must be a non-empty list.")
+    if len(trajectory) > MAX_TRAJECTORY_STEPS:
+        raise ValidationError(f"Field 'trajectory' exceeds the maximum of {MAX_TRAJECTORY_STEPS} steps.")
     if not all(isinstance(s, dict) for s in trajectory):
         raise ValidationError("Every 'trajectory' element must be an object.")
 
     sub_tasks = payload.get("sub_tasks")
     if not isinstance(sub_tasks, int) or isinstance(sub_tasks, bool) or sub_tasks < 1:
         raise ValidationError("Field 'sub_tasks' must be an integer >= 1.")
+    if sub_tasks > MAX_SUB_TASKS:
+        raise ValidationError(f"Field 'sub_tasks' exceeds the maximum of {MAX_SUB_TASKS}.")
 
     violations = payload.get("constraint_violations", 0)
     if not isinstance(violations, int) or isinstance(violations, bool) or violations < 0:
@@ -43,6 +53,8 @@ def validate_payload(payload: dict[str, Any]) -> None:
     episodes = payload.get("recovery_episodes", [])
     if not isinstance(episodes, list):
         raise ValidationError("Field 'recovery_episodes' must be a list.")
+    if len(episodes) > MAX_RECOVERY_EPISODES:
+        raise ValidationError(f"Field 'recovery_episodes' exceeds the maximum of {MAX_RECOVERY_EPISODES}.")
     for i, ep in enumerate(episodes):
         _validate_episode(ep, i)
 
