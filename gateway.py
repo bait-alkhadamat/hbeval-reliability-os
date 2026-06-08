@@ -111,14 +111,45 @@ else:
 
 
 # ── 4. Lifespan ─────────────────────────────────────────────────────────────
+# Module-level Redis handle, shared by the rate limiter, the nonce-replay guard,
+# and the daily-cap counter. Set during lifespan startup. If Redis is
+# unavailable, _redis stays None and the guards fail SAFE (see helpers below).
+_redis = None
+
+
+async def _nonce_already_used(nonce: str) -> bool:
+    """
+    Replay protection. Record each nonce in Redis with a TTL slightly longer
+    than the signature freshness window (5 min). If the same nonce arrives
+    twice, the second time is a replay and is rejected.
+
+    Fail-closed choice: if Redis is down we REJECT (return True) for the
+    /evaluate path rather than allow a possible replay. Availability of Redis
+    is already required for rate limiting, so this does not add a new
+    dependency — it hardens an existing one.
+    """
+    if _redis is None:
+        # Redis unavailable: be conservative. Reject to prevent replay.
+        return True
+    try:
+        # SET key value NX EX 360 → returns True only if the key did NOT exist.
+        was_set = await _redis.set(f"nonce:{nonce}", "1", nx=True, ex=360)
+        return not was_set        # if it was already set, this is a replay
+    except Exception as exc:
+        logger.error("Nonce check failed: %s. Rejecting to be safe.", exc)
+        return True
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global _redis
     try:
         redis_conn = await aioredis.from_url(_REDIS_URL, decode_responses=True)
         await FastAPILimiter.init(redis_conn)
-        logger.info("Rate limiter initialised.")
+        _redis = redis_conn
+        logger.info("Rate limiter + nonce guard initialised.")
     except Exception as exc:
-        logger.error("Rate limiter unavailable: %s. Proceeding without.", exc)
+        logger.error("Redis unavailable: %s. Proceeding without.", exc)
     yield
     logger.info("Gateway shutting down.")
 
@@ -201,7 +232,8 @@ async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, 
             return (
                 _supabase.table("agents")
                 .select("id, plan_type, evaluation_limit, evaluations_this_month, "
-                        "last_reset_date, aes_key_encrypted, hmac_secret_encrypted, "
+                        "last_reset_date, evaluations_today, last_eval_date, "
+                        "aes_key_encrypted, hmac_secret_encrypted, "
                         "is_active")
                 .eq("api_key", api_key)
                 .execute()
@@ -250,6 +282,8 @@ async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, 
             "evaluation_limit": row.get("evaluation_limit", 500),
             "evaluations_this_month": row.get("evaluations_this_month", 0),
             "last_reset_date": row.get("last_reset_date", "2000-01-01"),
+            "evaluations_today": row.get("evaluations_today", 0),
+            "last_eval_date": row.get("last_eval_date", "2000-01-01"),
         }
     else:
         # Development fallback only.
@@ -292,6 +326,24 @@ async def usage_gate(auth: dict = Depends(verify_api_key)) -> dict:
         else:
             detail = f"Monthly limit of {limit} reached. Contact support."
         raise HTTPException(status_code=429, detail=detail)
+
+    # Daily cap: the monthly allowance is spread across the month so no single
+    # day can exhaust it. Cap = ceil(limit / 28). Enforced here, server-side —
+    # the dashboard only visualises this; this is the authoritative check.
+    import math
+    daily_cap = max(1, math.ceil(limit / 28))
+    try:
+        last_eval = datetime.fromisoformat(str(auth.get("last_eval_date", "2000-01-01")))
+        same_day = (last_eval.date() == now.date())
+        used_today = auth.get("evaluations_today", 0) if same_day else 0
+    except (ValueError, TypeError):
+        used_today = 0
+    if used_today >= daily_cap:
+        raise HTTPException(
+            status_code=429,
+            detail=(f"Daily limit reached ({daily_cap}/day). Your monthly allowance is "
+                    "spread across the month; please continue tomorrow."),
+        )
     return auth
 
 
@@ -311,6 +363,19 @@ async def _increment_usage(project_id: str) -> None:
         await asyncio.to_thread(_rpc)
     except Exception as exc:
         logger.error("Usage increment failed for %s: %s", project_id, exc)
+
+    # Daily counter: increment evaluations_today, resetting it when the date
+    # rolls over. Done via a dedicated RPC so the logic is atomic server-side.
+    def _rpc_daily():
+        _supabase.rpc("increment_daily_usage", {
+            "p_project_id": project_id,
+            "p_today": now.date().isoformat(),
+        }).execute()
+
+    try:
+        await asyncio.to_thread(_rpc_daily)
+    except Exception as exc:
+        logger.error("Daily usage increment failed for %s: %s", project_id, exc)
 
 
 # ── 9. Rate-limit identifier ─────────────────────────────────────────────────
@@ -489,6 +554,13 @@ async def evaluate(
             status_code = exc.status_code
             error_code = "INVALID_SIGNATURE" if exc.status_code == 403 else "INVALID_TIMESTAMP"
             raise
+
+        # Replay protection: a valid signature + fresh timestamp is not enough —
+        # an attacker could capture and resend an authentic request within the
+        # 5-minute window. Each nonce may be used only once.
+        if await _nonce_already_used(nonce):
+            status_code, error_code = 409, "REPLAY_DETECTED"
+            raise HTTPException(status_code=409, detail="This request has already been processed (replay detected).")
 
         # Decrypt with the PER-AGENT AES key (two-layer model). The master key
         # already decrypted this agent's key in verify_api_key; here we use that
