@@ -231,7 +231,7 @@ async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, 
         def _query():
             return (
                 _supabase.table("agents")
-                .select("id, plan_type, evaluation_limit, evaluations_this_month, "
+                .select("id, user_id, plan_type, evaluation_limit, evaluations_this_month, "
                         "last_reset_date, evaluations_today, last_eval_date, "
                         "aes_key_encrypted, hmac_secret_encrypted, "
                         "is_active")
@@ -275,6 +275,7 @@ async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, 
         return {
             "project_id": row["id"],           # kept key name for downstream compatibility
             "agent_id_pk": row["id"],
+            "user_id": row.get("user_id"),     # account owner — for account-level usage
             "api_key_hash": api_key_hash,
             "signing_secret": signing_secret,
             "agent_aes_key": agent_aes_key,    # per-agent key for payload decryption
@@ -306,44 +307,78 @@ async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, 
 
 
 # ── 8. Usage gate ────────────────────────────────────────────────────────────
+# Account-level limits. The monthly allowance belongs to the ACCOUNT, not to
+# each agent — so a user with 10 agents still shares ONE pool of 500 (free) or
+# 10,000 (pro). We compute the account's total usage by summing across all the
+# owner's agents. The daily cap is likewise account-wide (allowance / 28).
+ACCOUNT_LIMITS = {"free": 500, "pro": 10_000, "enterprise": 100_000}
+
+
 async def usage_gate(auth: dict = Depends(verify_api_key)) -> dict:
     if not _supabase:
         return auth
+    import math
     now = datetime.now(timezone.utc)
-    limit = auth["evaluation_limit"]
-    try:
-        stored = datetime.fromisoformat(str(auth["last_reset_date"]))
-        same_month = (stored.year == now.year and stored.month == now.month)
-        current = auth["evaluations_this_month"] if same_month else 0
-    except (ValueError, TypeError):
-        current = 0
-    if current >= limit:
-        if auth["plan_type"] == "free":
-            detail = (
-                f"Monthly evaluation limit reached ({limit}). "
-                "Upgrade at https://hbeval.com/pricing for 10,000 evaluations/month."
-            )
+    plan = auth.get("plan_type", "free")
+    user_id = auth.get("user_id")
+
+    # The authoritative account limit comes from the plan, not from summing
+    # per-agent limits (which caused the 500-per-agent bug).
+    account_limit = ACCOUNT_LIMITS.get(plan, 500)
+
+    # Sum this account's usage across ALL its agents (this month / today).
+    month_used = 0
+    today_used = 0
+    if user_id:
+        def _q():
+            return (_supabase.table("agents")
+                    .select("evaluations_this_month, last_reset_date, "
+                            "evaluations_today, last_eval_date")
+                    .eq("user_id", user_id).execute())
+        try:
+            res = await asyncio.to_thread(_q)
+            for a in (res.data or []):
+                # month
+                try:
+                    d = datetime.fromisoformat(str(a.get("last_reset_date", "2000-01-01")))
+                    if d.year == now.year and d.month == now.month:
+                        month_used += a.get("evaluations_this_month", 0) or 0
+                except (ValueError, TypeError):
+                    pass
+                # today
+                try:
+                    d2 = datetime.fromisoformat(str(a.get("last_eval_date", "2000-01-01")))
+                    if d2.date() == now.date():
+                        today_used += a.get("evaluations_today", 0) or 0
+                except (ValueError, TypeError):
+                    pass
+        except Exception as exc:
+            logger.error("Account usage sum failed for %s: %s", user_id, exc)
+            # Fail open to the agent's own counters rather than blocking wrongly.
+            month_used = auth.get("evaluations_this_month", 0) or 0
+            today_used = auth.get("evaluations_today", 0) or 0
+
+    # Monthly ceiling.
+    if month_used >= account_limit:
+        if plan == "free":
+            detail = (f"Monthly account limit reached ({account_limit}). "
+                      "Upgrade at https://hbeval.com/pricing for 10,000 evaluations/month.")
         else:
-            detail = f"Monthly limit of {limit} reached. Contact support."
+            detail = f"Monthly account limit of {account_limit} reached. Contact support."
         raise HTTPException(status_code=429, detail=detail)
 
-    # Daily cap: the monthly allowance is spread across the month so no single
-    # day can exhaust it. Cap = ceil(limit / 28). Enforced here, server-side —
-    # the dashboard only visualises this; this is the authoritative check.
-    import math
-    daily_cap = max(1, math.ceil(limit / 28))
-    try:
-        last_eval = datetime.fromisoformat(str(auth.get("last_eval_date", "2000-01-01")))
-        same_day = (last_eval.date() == now.date())
-        used_today = auth.get("evaluations_today", 0) if same_day else 0
-    except (ValueError, TypeError):
-        used_today = 0
-    if used_today >= daily_cap:
+    # Daily ceiling (account-wide): allowance spread across 28 days.
+    daily_cap = max(1, math.ceil(account_limit / 28))
+    if today_used >= daily_cap:
         raise HTTPException(
             status_code=429,
-            detail=(f"Daily limit reached ({daily_cap}/day). Your monthly allowance is "
-                    "spread across the month; please continue tomorrow."),
+            detail=(f"Daily account limit reached ({daily_cap}/day). Your monthly "
+                    "allowance is spread across the month; please continue tomorrow."),
         )
+
+    # Expose computed account usage downstream (e.g. for response metadata).
+    auth["account_month_used"] = month_used
+    auth["account_limit"] = account_limit
     return auth
 
 
