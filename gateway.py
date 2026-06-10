@@ -65,6 +65,7 @@ from supabase import Client, create_client
 from engines import HBEvalEngines
 from validation import validate_payload, ValidationError
 import edm_guard  # Layer 1: EDM selective-storage guard (persistence governance)
+import hci_edm    # Layer 2: HCI-EDM performance-grounded interpretability
 
 # ── 1. Logging ────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -763,6 +764,66 @@ async def memory_retrieve(
         asyncio.create_task(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/api/v1/memory/retrieve", method="POST", status_code=status_code,
+            request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
+        ))
+
+
+@app.post("/api/v1/explain", tags=["Interpretability"])
+async def explain(
+    http_request: Request,
+    body: EncryptedEvaluationRequest,
+    auth: dict = Depends(verify_api_key),
+    _rate: bool = Depends(RateLimiter(times=100, seconds=60, identifier=_api_key_identifier)),
+) -> dict:
+    """
+    Layer 2 — HCI-EDM performance-grounded interpretability.
+    Returns an explanation grounded in a certified stored episode, or the
+    mandatory uncertainty response when no qualified precedent exists.
+    Payload (decrypted) must contain a "plan_summary" string.
+    """
+    run_id = str(uuid.uuid4())
+    project_id = auth["project_id"]
+    api_key_hash = auth["api_key_hash"]
+    start_time = time.monotonic()
+    status_code, error_code = 500, "UNKNOWN_ERROR"
+
+    try:
+        nonce = http_request.headers.get("X-HBEval-Nonce", "")
+        timestamp = http_request.headers.get("X-HBEval-Timestamp", "")
+        signature = http_request.headers.get("X-HBEval-Signature", "")
+        if not all([nonce, timestamp, signature]):
+            status_code, error_code = 400, "MISSING_SECURITY_HEADERS"
+            raise HTTPException(status_code=400, detail="Missing security headers.")
+
+        _verify_signature(auth["signing_secret"], nonce, timestamp, body.ciphertext, signature)
+
+        aesgcm = AESGCM(auth["agent_aes_key"])
+        gcm_nonce = bytes.fromhex(nonce)
+        decrypted = aesgcm.decrypt(gcm_nonce, bytes.fromhex(body.ciphertext), None)
+        payload = json.loads(decrypted.decode())
+
+        plan_summary = str(payload.get("plan_summary", "")).strip()
+        if not plan_summary:
+            status_code, error_code = 400, "MISSING_PLAN_SUMMARY"
+            raise HTTPException(status_code=400, detail="plan_summary is required.")
+
+        result = await asyncio.to_thread(
+            hci_edm.explain, _supabase, project_id, plan_summary
+        )
+        status_code, error_code = 200, None
+        return {**result, "run_id": run_id}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unhandled error in explain.")
+        status_code, error_code = 500, "INTERNAL_SERVER_ERROR"
+        raise HTTPException(status_code=500, detail="Internal server error.")
+    finally:
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        ip_raw = http_request.client.host if http_request.client else None
+        asyncio.create_task(_audit_log(
+            project_id=project_id, api_key_hash=api_key_hash,
+            endpoint="/api/v1/explain", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
 
