@@ -64,6 +64,7 @@ from supabase import Client, create_client
 
 from engines import HBEvalEngines
 from validation import validate_payload, ValidationError
+import edm_guard  # Layer 1: EDM selective-storage guard (persistence governance)
 
 # ── 1. Logging ────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -624,6 +625,8 @@ async def evaluate(
 
         gated = _apply_plan_gates(result, plan_type)
         asyncio.create_task(_store_evaluation(run_id, project_id, agent_id, payload, result))
+        # Layer 1 — EDM selective storage: consolidate only if PEI>=0.8 AND TI>=4.0
+        asyncio.create_task(edm_guard.consolidate(_supabase, run_id, project_id, payload, result))
 
         success, status_code, error_code = True, 200, None
         return {**gated, "run_id": run_id}
@@ -680,6 +683,7 @@ async def evaluate_plain(
         result = HBEvalEngines.evaluate(payload, history)
         gated = _apply_plan_gates(result, plan_type)
         asyncio.create_task(_store_evaluation(run_id, project_id, agent_id, payload, result))
+        asyncio.create_task(edm_guard.consolidate(_supabase, run_id, project_id, payload, result))
         success, status_code, error_code = True, 200, None
         return {**gated, "run_id": run_id}
     except HTTPException:
