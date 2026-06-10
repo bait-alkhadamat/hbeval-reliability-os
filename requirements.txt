@@ -24,3 +24,10 @@ supabase>=2.4,<3
 
 # ── Data validation ────────────────────────────────────────────────────────
 pydantic>=2.6,<3
+
+# ── EDM Layer 1: lightweight local embeddings (all-MiniLM-L6-v2, 384-dim) ───
+# CPU-only torch keeps the image far smaller than the default CUDA build —
+# important for Railway memory limits. The model (~90 MB) loads lazily on
+# first consolidation; if it can't load, the guard degrades gracefully and
+# the core evaluation is unaffected.
+sentence-transformers>=2.7,<3
