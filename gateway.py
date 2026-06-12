@@ -56,6 +56,7 @@ from typing import Any
 import redis.asyncio as aioredis
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
@@ -164,6 +165,31 @@ app = FastAPI(
     redoc_url=None,
     lifespan=lifespan,
 )
+
+
+# ── 4b. CORS ─────────────────────────────────────────────────────────────────
+# Allowed browser origins are read from the ALLOWED_ORIGINS environment
+# variable (set in Railway), a comma-separated list, e.g.:
+#   https://hbeval.com,https://www.hbeval.com
+# If the variable is unset we fall back to "*" ONLY in dev mode; in
+# production an unset variable yields an empty allow-list (fail-closed),
+# so a misconfiguration cannot silently open the gateway to every origin.
+_origins_raw = os.getenv("ALLOWED_ORIGINS", "").strip()
+if _origins_raw == "*":
+    _allowed_origins = ["*"]
+elif _origins_raw:
+    _allowed_origins = [o.strip() for o in _origins_raw.split(",") if o.strip()]
+else:
+    _allowed_origins = ["*"] if _DEV_MODE else []
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+logger.info("CORS allowed origins: %s", _allowed_origins or "(none — fail-closed)")
 
 
 # ── 5. Models ────────────────────────────────────────────────────────────────
