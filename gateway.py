@@ -65,6 +65,7 @@ from supabase import Client, create_client
 
 from engines import HBEvalEngines
 from validation import validate_payload, ValidationError
+from scenario_orchestrator import aggregate_battery_results
 import edm_guard  # Layer 1: EDM selective-storage guard (persistence governance)
 import hci_edm    # Layer 2: HCI-EDM performance-grounded interpretability
 
@@ -670,6 +671,236 @@ async def evaluate(
         asyncio.create_task(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/evaluate", method="POST", status_code=status_code,
+            request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
+        ))
+        if success:
+            asyncio.create_task(_increment_usage(project_id))
+
+
+@app.post("/evaluate_battery", tags=["Evaluation"])
+async def evaluate_battery(
+    http_request: Request,
+    body: EncryptedEvaluationRequest,
+    auth: dict = Depends(usage_gate),
+    _rate: bool = Depends(RateLimiter(times=100, seconds=60, identifier=_api_key_identifier)),
+) -> dict:
+    """Active evaluation: score an SDK-collected fault-injection battery.
+
+    The SDK runs the agent across the injected scenario battery and sends the
+    raw per-scenario responses here (encrypted + signed, exactly like
+    /evaluate). The SERVER scores all five metrics and decides the verdict —
+    the client never scores itself, which keeps strictness authoritative and
+    tamper-resistant. Returns a comprehensive report (verdict + summary +
+    per-scenario detail), not a single number.
+    """
+    run_id = str(uuid.uuid4())
+    project_id = auth["project_id"]
+    api_key_hash = auth["api_key_hash"]
+    plan_type = auth["plan_type"]
+    start_time = time.monotonic()
+    status_code, error_code, success = 500, "UNKNOWN_ERROR", False
+
+    try:
+        nonce = http_request.headers.get("X-HBEval-Nonce", "")
+        timestamp = http_request.headers.get("X-HBEval-Timestamp", "")
+        signature = http_request.headers.get("X-HBEval-Signature", "")
+
+        if not all([nonce, timestamp, signature]):
+            status_code, error_code = 400, "MISSING_SECURITY_HEADERS"
+            raise HTTPException(status_code=400, detail="Missing security headers.")
+
+        # Same signature verification as /evaluate (Protocol §4).
+        try:
+            _verify_signature(auth["signing_secret"], nonce, timestamp, body.ciphertext, signature)
+        except HTTPException as exc:
+            status_code = exc.status_code
+            error_code = "INVALID_SIGNATURE" if exc.status_code == 403 else "INVALID_TIMESTAMP"
+            raise
+
+        # Same replay protection.
+        if await _nonce_already_used(nonce):
+            status_code, error_code = 409, "REPLAY_DETECTED"
+            raise HTTPException(status_code=409, detail="This request has already been processed (replay detected).")
+
+        # Same per-agent AES decryption.
+        try:
+            aesgcm = AESGCM(auth["agent_aes_key"])
+            gcm_nonce = bytes.fromhex(nonce)
+            raw_bytes = bytes.fromhex(body.ciphertext)
+            decrypted = aesgcm.decrypt(gcm_nonce, raw_bytes, None)
+            payload = json.loads(decrypted.decode())
+        except Exception as exc:
+            status_code, error_code = 400, "DECRYPTION_FAILED"
+            logger.warning("Battery decryption failed (run %s): %s", run_id, exc)
+            raise HTTPException(status_code=400, detail="Payload decryption failed.")
+
+        # Validate the battery payload shape (defense in depth).
+        scenario_results = payload.get("scenario_results")
+        if not isinstance(scenario_results, list) or not scenario_results:
+            status_code, error_code = 400, "VALIDATION_FAILED"
+            raise HTTPException(status_code=400, detail="Field 'scenario_results' must be a non-empty list.")
+
+        # Hard ceiling on battery size (DoS protection, mirrors MAX_SCENARIOS).
+        if len(scenario_results) > 60:
+            status_code, error_code = 400, "BATTERY_TOO_LARGE"
+            raise HTTPException(status_code=400, detail="Battery exceeds the maximum of 60 scenarios.")
+
+        agent_id = payload.get("agent_id", "unknown-agent")
+        required = payload.get("required_in_response", [])
+
+        # Server-authoritative scoring — the client cannot tamper with this.
+        report = aggregate_battery_results(scenario_results, required)
+
+        gated = _apply_plan_gates(report, plan_type)
+        asyncio.create_task(_store_evaluation(run_id, project_id, agent_id, payload, report))
+        # EDM consolidation uses the aggregate report (high-quality episodes).
+        asyncio.create_task(edm_guard.consolidate(_supabase, run_id, project_id, payload, report))
+
+        success, status_code, error_code = True, 200, None
+        return {**gated, "run_id": run_id}
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unhandled error in /evaluate_battery (run %s).", run_id)
+        status_code, error_code = 500, "INTERNAL_SERVER_ERROR"
+        raise HTTPException(status_code=500, detail="Internal server error.")
+    finally:
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        ip_raw = http_request.client.host if http_request.client else None
+        asyncio.create_task(_audit_log(
+            project_id=project_id, api_key_hash=api_key_hash,
+            endpoint="/evaluate_battery", method="POST", status_code=status_code,
+            request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
+        ))
+        if success:
+            asyncio.create_task(_increment_usage(project_id))
+
+
+
+@app.post("/evaluate_verified", tags=["Evaluation"])
+async def evaluate_verified(
+    http_request: Request,
+    body: EncryptedEvaluationRequest,
+    auth: dict = Depends(usage_gate),
+    _rate: bool = Depends(RateLimiter(times=20, seconds=60, identifier=_api_key_identifier)),
+) -> dict:
+    """Verified active evaluation (paid path A).
+
+    The PLATFORM calls the user's agent endpoint across the fault-injection
+    battery — the user never touches the middle, so the result cannot be
+    tampered with and earns a `verified` mark. Because this consumes platform
+    resources (outbound calls, up to 100 scenarios), it is restricted to paid
+    plans and carries tighter rate limits.
+
+    Security: the agent URL is SSRF-validated before any call; outbound calls
+    are IP-pinned, timeout-bounded, redirect-refused, and size-capped
+    (see verified_runner + ssrf_guard). Encrypted + signed like /evaluate.
+    """
+    run_id = str(uuid.uuid4())
+    project_id = auth["project_id"]
+    api_key_hash = auth["api_key_hash"]
+    plan_type = auth["plan_type"]
+    start_time = time.monotonic()
+    status_code, error_code, success = 500, "UNKNOWN_ERROR", False
+
+    try:
+        # ── Paid-plan gate: verified path is not available on the free plan ──
+        if plan_type in (None, "free", "trial"):
+            status_code, error_code = 402, "UPGRADE_REQUIRED"
+            raise HTTPException(
+                status_code=402,
+                detail=("The verified evaluation path requires a paid plan. "
+                        "Use /evaluate_battery (local run) on the free plan."),
+            )
+
+        # ── Same security envelope as /evaluate (signature + nonce + decrypt) ──
+        nonce = http_request.headers.get("X-HBEval-Nonce", "")
+        timestamp = http_request.headers.get("X-HBEval-Timestamp", "")
+        signature = http_request.headers.get("X-HBEval-Signature", "")
+        if not all([nonce, timestamp, signature]):
+            status_code, error_code = 400, "MISSING_SECURITY_HEADERS"
+            raise HTTPException(status_code=400, detail="Missing security headers.")
+
+        try:
+            _verify_signature(auth["signing_secret"], nonce, timestamp, body.ciphertext, signature)
+        except HTTPException as exc:
+            status_code = exc.status_code
+            error_code = "INVALID_SIGNATURE" if exc.status_code == 403 else "INVALID_TIMESTAMP"
+            raise
+
+        if await _nonce_already_used(nonce):
+            status_code, error_code = 409, "REPLAY_DETECTED"
+            raise HTTPException(status_code=409, detail="This request has already been processed (replay detected).")
+
+        try:
+            aesgcm = AESGCM(auth["agent_aes_key"])
+            gcm_nonce = bytes.fromhex(nonce)
+            raw_bytes = bytes.fromhex(body.ciphertext)
+            decrypted = aesgcm.decrypt(gcm_nonce, raw_bytes, None)
+            payload = json.loads(decrypted.decode())
+        except Exception as exc:
+            status_code, error_code = 400, "DECRYPTION_FAILED"
+            logger.warning("Decryption failed (verified run %s): %s", run_id, exc)
+            raise HTTPException(status_code=400, detail="Payload decryption failed.")
+
+        # ── Verified-path inputs ──
+        agent_url = payload.get("agent_url", "")
+        base_task = payload.get("base_task", {})
+        n_scenarios = int(payload.get("n_scenarios", 30))
+        consent = payload.get("consent", False)
+        agent_headers = payload.get("agent_headers", {}) or {}
+        required = payload.get("required_in_response", []) or base_task.get("required_in_response", [])
+
+        # ── Explicit consent is mandatory before we call an external agent ──
+        if not consent:
+            status_code, error_code = 400, "CONSENT_REQUIRED"
+            raise HTTPException(
+                status_code=400,
+                detail=("Explicit consent is required: the platform will call "
+                        "your agent endpoint across multiple scenarios. Set "
+                        "consent=true to proceed."),
+            )
+
+        # ── SSRF validation happens inside run_verified_battery (fail-closed) ──
+        try:
+            from verified_runner import run_verified_battery, VerifiedRunError
+            from ssrf_guard import SSRFValidationError
+            records = await run_verified_battery(
+                agent_url=agent_url, base_task=base_task,
+                n_scenarios=n_scenarios, headers=agent_headers,
+            )
+        except SSRFValidationError as exc:
+            status_code, error_code = 400, "UNSAFE_AGENT_URL"
+            raise HTTPException(status_code=400, detail=f"Agent URL rejected: {exc}")
+        except VerifiedRunError as exc:
+            status_code, error_code = 400, "VERIFIED_RUN_ERROR"
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        # ── Server-side scoring (authoritative, tamper-proof) ──
+        report = aggregate_battery_results(records, required)
+        report["verification"] = "verified"   # the platform ran it end-to-end
+
+        agent_id = payload.get("agent_id", "verified-agent")
+        gated = _apply_plan_gates(report, plan_type)
+        asyncio.create_task(_store_evaluation(run_id, project_id, agent_id, payload, report))
+        asyncio.create_task(edm_guard.consolidate(_supabase, run_id, project_id, payload, report))
+
+        success, status_code, error_code = True, 200, None
+        return {**gated, "run_id": run_id}
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unhandled error in /evaluate_verified (run %s).", run_id)
+        status_code, error_code = 500, "INTERNAL_SERVER_ERROR"
+        raise HTTPException(status_code=500, detail="Internal server error.")
+    finally:
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        ip_raw = http_request.client.host if http_request.client else None
+        asyncio.create_task(_audit_log(
+            project_id=project_id, api_key_hash=api_key_hash,
+            endpoint="/evaluate_verified", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
         if success:
