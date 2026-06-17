@@ -340,7 +340,7 @@ async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, 
 # each agent — so a user with 10 agents still shares ONE pool of 500 (free) or
 # 10,000 (pro). We compute the account's total usage by summing across all the
 # owner's agents. The daily cap is likewise account-wide (allowance / 28).
-ACCOUNT_LIMITS = {"free": 500, "pro": 10_000, "enterprise": 100_000}
+ACCOUNT_LIMITS = {"free": 500, "pro": 5_000, "enterprise": 2_147_483_647}
 
 
 async def usage_gate(auth: dict = Depends(verify_api_key)) -> dict:
@@ -351,39 +351,43 @@ async def usage_gate(auth: dict = Depends(verify_api_key)) -> dict:
     plan = auth.get("plan_type", "free")
     user_id = auth.get("user_id")
 
-    # The authoritative account limit comes from the plan, not from summing
-    # per-agent limits (which caused the 500-per-agent bug).
+    # The authoritative monthly limit is the ACCOUNT limit for the plan.
     account_limit = ACCOUNT_LIMITS.get(plan, 500)
-
-    # Sum this account's usage across ALL its agents (this month / today).
     month_used = 0
     today_used = 0
+
+    # Read the shared account counter from account_usage (migration 08). This is
+    # the single source of truth: one pool per account, shared by all its agents.
     if user_id:
         def _q():
-            return (_supabase.table("agents")
-                    .select("evaluations_this_month, last_reset_date, "
-                            "evaluations_today, last_eval_date")
-                    .eq("user_id", user_id).execute())
+            return (_supabase.rpc("get_account_quota", {"p_user_id": user_id})
+                    .execute())
         try:
             res = await asyncio.to_thread(_q)
-            for a in (res.data or []):
-                # month
-                try:
-                    d = datetime.fromisoformat(str(a.get("last_reset_date", "2000-01-01")))
-                    if d.year == now.year and d.month == now.month:
-                        month_used += a.get("evaluations_this_month", 0) or 0
-                except (ValueError, TypeError):
-                    pass
-                # today
+            rows = res.data or []
+            if rows:
+                row = rows[0]
+                # Trust the plan-derived limit, but prefer the stored one if set.
+                account_limit = row.get("evaluation_limit") or account_limit
+                month_used = row.get("evaluations_this_month", 0) or 0
+            # Daily counter still read directly (separate column).
+            def _qd():
+                return (_supabase.table("account_usage")
+                        .select("evaluations_today, last_eval_date")
+                        .eq("user_id", user_id).execute())
+            resd = await asyncio.to_thread(_qd)
+            for a in (resd.data or []):
                 try:
                     d2 = datetime.fromisoformat(str(a.get("last_eval_date", "2000-01-01")))
                     if d2.date() == now.date():
-                        today_used += a.get("evaluations_today", 0) or 0
+                        today_used = a.get("evaluations_today", 0) or 0
                 except (ValueError, TypeError):
                     pass
         except Exception as exc:
-            logger.error("Account usage sum failed for %s: %s", user_id, exc)
-            # Fail open to the agent's own counters rather than blocking wrongly.
+            logger.error("Account quota read failed for %s: %s", user_id, exc)
+            # Fail closed on the monthly ceiling would block legitimate users on a
+            # transient DB error; instead fall back to the agent's own counter,
+            # which is conservative (never grants more than the account pool).
             month_used = auth.get("evaluations_this_month", 0) or 0
             today_used = auth.get("evaluations_today", 0) or 0
 
@@ -391,7 +395,7 @@ async def usage_gate(auth: dict = Depends(verify_api_key)) -> dict:
     if month_used >= account_limit:
         if plan == "free":
             detail = (f"Monthly account limit reached ({account_limit}). "
-                      "Upgrade at https://hbeval.com/pricing for 10,000 evaluations/month.")
+                      "Upgrade at https://hbeval.com/pricing for 5,000 evaluations/month.")
         else:
             detail = f"Monthly account limit of {account_limit} reached. Contact support."
         raise HTTPException(status_code=429, detail=detail)
@@ -405,55 +409,50 @@ async def usage_gate(auth: dict = Depends(verify_api_key)) -> dict:
                     "allowance is spread across the month; please continue tomorrow."),
         )
 
-    # Expose computed account usage downstream (e.g. for response metadata).
     auth["account_month_used"] = month_used
     auth["account_limit"] = account_limit
     return auth
 
 
-async def _increment_usage(project_id: str, count: int = 1) -> None:
-    """Increment a project's usage by `count` evaluation units.
+async def _increment_usage(user_id: str | None, count: int = 1) -> None:
+    """Increment the ACCOUNT's shared usage by `count` evaluation units.
 
-    Fair-billing rule: a single API call may consume MORE than one evaluation
-    unit. A battery of N fault-injection scenarios runs the agent N times and
-    therefore costs N units, not one. Passing count=N keeps the monthly quota
-    (e.g. 500) tied to real resource consumption, and closes an abuse vector
-    where a caller could run thousands of real evaluations for the price of one.
+    The monthly pool belongs to the account (user), shared by all its agents
+    (migration 08). A battery of N scenarios costs N units. We call the
+    account-level RPCs, which atomically add N to the shared counter and handle
+    month/day rollover server-side. count is clamped (DoS guard).
 
-    Implemented by invoking the existing atomic RPC `count` times, so no
-    database migration is required. count is clamped to a sane range.
+    If user_id is missing (e.g. dev key), we no-op rather than miscount.
     """
-    if not _supabase:
+    if not _supabase or not user_id:
         return
-    count = max(1, min(int(count), 100))   # never < 1, never absurd (DoS guard)
+    count = max(1, min(int(count), 100))   # never < 1, never absurd
     now = datetime.now(timezone.utc)
 
-    def _rpc():
-        for _ in range(count):
-            _supabase.rpc("increment_usage", {
-                "p_project_id": project_id,
-                "p_current_year": now.year,
-                "p_current_month": now.month,
-            }).execute()
+    def _rpc_month():
+        _supabase.rpc("increment_account_usage", {
+            "p_user_id": user_id,
+            "p_count": count,
+            "p_current_year": now.year,
+            "p_current_month": now.month,
+        }).execute()
 
     try:
-        await asyncio.to_thread(_rpc)
+        await asyncio.to_thread(_rpc_month)
     except Exception as exc:
-        logger.error("Usage increment failed for %s: %s", project_id, exc)
+        logger.error("Account usage increment failed for %s: %s", user_id, exc)
 
-    # Daily counter: increment evaluations_today, resetting it when the date
-    # rolls over. Done via a dedicated RPC so the logic is atomic server-side.
     def _rpc_daily():
-        for _ in range(count):
-            _supabase.rpc("increment_daily_usage", {
-                "p_project_id": project_id,
-                "p_today": now.date().isoformat(),
-            }).execute()
+        _supabase.rpc("increment_account_daily", {
+            "p_user_id": user_id,
+            "p_count": count,
+            "p_today": now.date().isoformat(),
+        }).execute()
 
     try:
         await asyncio.to_thread(_rpc_daily)
     except Exception as exc:
-        logger.error("Daily usage increment failed for %s: %s", project_id, exc)
+        logger.error("Account daily increment failed for %s: %s", user_id, exc)
 
 
 # ── 9. Rate-limit identifier ─────────────────────────────────────────────────
@@ -688,7 +687,7 @@ async def evaluate(
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
         if success:
-            asyncio.create_task(_increment_usage(project_id))
+            asyncio.create_task(_increment_usage(auth.get("user_id")))
 
 
 @app.post("/evaluate_battery", tags=["Evaluation"])
@@ -792,7 +791,7 @@ async def evaluate_battery(
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
         if success:
-            asyncio.create_task(_increment_usage(project_id, billable_units))
+            asyncio.create_task(_increment_usage(auth.get("user_id"), billable_units))
 
 
 
@@ -925,7 +924,7 @@ async def evaluate_verified(
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
         if success:
-            asyncio.create_task(_increment_usage(project_id, billable_units))
+            asyncio.create_task(_increment_usage(auth.get("user_id"), billable_units))
 
 
 @app.post("/evaluate_plain", tags=["Evaluation"])
@@ -980,7 +979,7 @@ async def evaluate_plain(
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
         if success:
-            asyncio.create_task(_increment_usage(project_id))
+            asyncio.create_task(_increment_usage(auth.get("user_id")))
 
 
 @app.post("/api/v1/memory/retrieve", tags=["Memory"])
