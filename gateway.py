@@ -1,5 +1,5 @@
 """
-HB-Eval OS — Reliability Gateway v2.1.0
+HB-Eval — Reliability Gateway v2.2.0
 ========================================
 Production FastAPI application deployed on Railway (private repo).
 
@@ -19,10 +19,13 @@ The four silent contract bugs found in the v2.0.0 review are all fixed here:
      The plain-request model and validation use that exact field name. The old
      recovery_attempts integer is gone.
 
-  4. Identity (the fourth bug): the Gateway reads from the `projects` table,
-     which is the live table (it holds the real rows). The unused `agents`
-     table is not consulted. The platform must also write new users to
-     `projects` — documented in the README.
+  4. Identity (the fourth bug): the Gateway reads agent/account identity from
+     the `agents` table, which is the live, current identity table (it holds
+     the real rows: api_key, per-agent encrypted secrets, plan_type, and the
+     owning user_id). The field name `project_id` is kept in the returned
+     auth context purely for downstream key-name compatibility with the SDK
+     and frontend, which still expect that key — it is populated from the
+     agent row's own id, not from a separate `projects` table.
 
 Server-side validation (Protocol §5) now rejects malformed payloads BEFORE
 the engine runs, mirroring the SDK's client-side validation: defense in depth.
@@ -77,7 +80,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hb-eval-gateway")
 
-PROTOCOL_VERSION = "2.1.0"
+# NOTE: tracks the wire protocol AND package version together (they are
+# intentionally kept in lockstep in this build). If you ever need the
+# protocol version to diverge from the SDK package version, split this
+# into PROTOCOL_VERSION and SOFTWARE_VERSION explicitly.
+PROTOCOL_VERSION = "2.2.0"
 
 
 # ── 2. Environment ──────────────────────────────────────────────────────────
@@ -159,7 +166,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(
-    title="HB-Eval OS Gateway",
+    title="HB-Eval Gateway",
     version=PROTOCOL_VERSION,
     description="Reliability evaluation gateway for agentic AI systems.",
     docs_url="/docs" if _DEV_MODE else None,
@@ -238,8 +245,9 @@ async def _extract_api_key(authorization: str | None = Header(default=None)) -> 
 
 async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, Any]:
     """
-    Validate the API key against the `agents` table (the unified identity
-    table) and return a context dict.
+    Validate the API key against the `agents` table — the current, live
+    identity table for both agents and their owning accounts — and return a
+    context dict.
 
     This is the two-layer security model. For each agent we recover TWO
     secrets here, both stored encrypted at rest under the master key:
@@ -337,9 +345,12 @@ async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, 
 
 # ── 8. Usage gate ────────────────────────────────────────────────────────────
 # Account-level limits. The monthly allowance belongs to the ACCOUNT, not to
-# each agent — so a user with 10 agents still shares ONE pool of 500 (free) or
-# 10,000 (pro). We compute the account's total usage by summing across all the
-# owner's agents. The daily cap is likewise account-wide (allowance / 28).
+# each agent — so a user with several agents still shares ONE pool of 500
+# (free) or 5,000 (pro). The authoritative counter lives in the account_usage
+# table (migration 08); usage_gate reads it via the get_account_quota RPC
+# rather than summing per-agent counters, so there is a single source of
+# truth for the whole account regardless of how many agents it owns. The
+# daily cap is likewise account-wide (allowance / 28).
 ACCOUNT_LIMITS = {"free": 500, "pro": 5_000, "enterprise": 2_147_483_647}
 
 
@@ -569,16 +580,17 @@ def _is_paid(plan_type: str) -> bool:
 
 def _apply_plan_gates(result: dict, plan_type: str) -> dict:
     """
-    Gate ONLY the formal certification, never the diagnostic value.
+    Gate ONLY the formal tier-qualification credential, never the diagnostic
+    value.
 
     Free-tier users receive the full metrics AND the full diagnostic guidance —
     they learn exactly where their agent stands and how to improve it. What
-    requires a paid plan is the *formal* certification artifact: the official,
-    displayable Tier stamp and the Agent Passport. This split is deliberate:
-    knowledge and mentorship are free (which is what earns trust and drives
-    word-of-mouth adoption), while the official, showable credential is the
-    paid product. A free user is never left with a bare "fail" — they always
-    receive the guidance that tells them why and what to do next.
+    requires a paid plan is the *formal* credential: the official, displayable
+    Tier-qualification stamp. This split is deliberate: knowledge and
+    mentorship are free (which is what earns trust and drives word-of-mouth
+    adoption), while the official, showable credential is the paid product. A
+    free user is never left with a bare "fail" — they always receive the
+    guidance that tells them why and what to do next.
     """
     if _is_paid(plan_type):
         return result
@@ -588,7 +600,7 @@ def _apply_plan_gates(result: dict, plan_type: str) -> dict:
     gated["certified"] = False
     gated["note"] = (
         "Your full metrics and improvement guidance are included. The formal "
-        "Tier-qualification credential and Agent Passport require a Pro plan. "
+        "Tier-qualification credential requires a Pro plan. "
         "See https://hbeval.com/pricing"
     )
     return gated
@@ -1101,6 +1113,192 @@ async def explain(
         asyncio.create_task(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/api/v1/explain", method="POST", status_code=status_code,
+            request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
+        ))
+
+
+# ── 15. Runtime monitoring ───────────────────────────────────────────────────
+# Stores closed monitoring sessions produced by the SDK's monitor() context
+# manager. Requires migration 09 (monitoring_sessions, monitoring_events).
+#
+# NOT metered against the evaluation quota, deliberately: the monitoring work
+# itself runs in the user's own process on their machine and costs the platform
+# nothing but a single small write per session. This matches the project-wide
+# rule that what runs on the user's machine is free, and what runs on our
+# infrastructure is paid. Managed monitoring (live dashboard, webhook dispatch)
+# is the paid tier, and it is gated where that work actually happens, not here.
+
+# Hard caps: a session summary is user-supplied data, so it is bounded before
+# it ever reaches the database.
+MAX_MONITORING_EVENTS = 500      # breaches stored per session
+MAX_MONITORING_STEPS = 100_000   # sanity ceiling on reported step count
+
+
+def _coerce_metric(value: Any) -> float | None:
+    """Accept a numeric metric or None.
+
+    None is preserved rather than coerced to 0.0. This matters: an undefined
+    metric (IRS with no faults injected, CSI within a single session) is not
+    the same as a metric that scored zero, and storing 0.0 would render an
+    agent as failing on a dimension that was never measured.
+    """
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _store_monitoring_session(user_id: str | None, project_id: str,
+                                    summary: dict) -> None:
+    """Persist a monitoring session and its breach events."""
+    if not _supabase:
+        return
+
+    metrics = summary.get("live_metrics") or {}
+    breaches = summary.get("breaches") or []
+    if len(breaches) > MAX_MONITORING_EVENTS:
+        breaches = breaches[:MAX_MONITORING_EVENTS]
+
+    session_id = str(summary.get("session_id", ""))[:200]
+    agent_id = str(summary.get("agent_id", "unknown-agent"))[:200]
+
+    def _to_iso(ts: Any) -> str | None:
+        try:
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            return None
+
+    def _write_session():
+        _supabase.table("monitoring_sessions").insert({
+            "session_id": session_id,
+            "user_id": user_id,
+            "agent_id": agent_id,
+            "started_at": _to_iso(summary.get("started_at")),
+            "ended_at": _to_iso(summary.get("ended_at")),
+            "duration_seconds": summary.get("duration_seconds"),
+            "step_count": min(int(summary.get("step_count", 0) or 0), MAX_MONITORING_STEPS),
+            "breach_count": len(breaches),
+            "halted": bool(summary.get("halted", False)),
+            "pei_live": _coerce_metric(metrics.get("pei")),
+            "frr_live": _coerce_metric(metrics.get("frr")),
+            "irs_live": _coerce_metric(metrics.get("irs")),
+            "ti_live": _coerce_metric(metrics.get("ti")),
+            "csi_live": _coerce_metric(metrics.get("csi")),
+            "thresholds": summary.get("thresholds") or {},
+            "metadata": summary.get("metadata") or {},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+
+    try:
+        await asyncio.to_thread(_write_session)
+    except Exception as exc:
+        logger.error("Monitoring session persist failed (%s): %s", session_id, exc)
+        return   # without the parent row, the events have nothing to attach to
+
+    if not breaches:
+        return
+
+    rows = []
+    for b in breaches:
+        try:
+            rows.append({
+                "session_id": session_id,
+                "user_id": user_id,
+                "metric": str(b.get("metric", ""))[:32],
+                "value": float(b.get("value")),
+                "threshold": float(b.get("threshold")),
+                "step_index": int(b.get("step_index", 0)),
+                "occurred_at": _to_iso(b.get("timestamp")) or datetime.now(timezone.utc).isoformat(),
+            })
+        except (TypeError, ValueError):
+            continue   # skip a malformed breach rather than losing the whole batch
+
+    if not rows:
+        return
+
+    def _write_events():
+        _supabase.table("monitoring_events").insert(rows).execute()
+
+    try:
+        await asyncio.to_thread(_write_events)
+    except Exception as exc:
+        logger.error("Monitoring events persist failed (%s): %s", session_id, exc)
+
+
+@app.post("/api/v1/monitoring/session", tags=["Monitoring"])
+async def monitoring_session(
+    http_request: Request,
+    body: EncryptedEvaluationRequest,
+    auth: dict = Depends(verify_api_key),
+    _rate: bool = Depends(RateLimiter(times=120, seconds=60, identifier=_api_key_identifier)),
+) -> dict:
+    """Record a closed runtime-monitoring session.
+
+    The SDK sends this once, when a monitor() context exits — never per step,
+    so real-time monitoring adds no per-step network latency to the agent's
+    execution path.
+
+    Same security envelope as every other endpoint: signed, nonce-protected
+    against replay, and decrypted with the per-agent AES key.
+    """
+    run_id = str(uuid.uuid4())
+    project_id = auth["project_id"]
+    api_key_hash = auth["api_key_hash"]
+    start_time = time.monotonic()
+    status_code, error_code = 500, "UNKNOWN_ERROR"
+
+    try:
+        nonce = http_request.headers.get("X-HBEval-Nonce", "")
+        timestamp = http_request.headers.get("X-HBEval-Timestamp", "")
+        signature = http_request.headers.get("X-HBEval-Signature", "")
+        if not all([nonce, timestamp, signature]):
+            status_code, error_code = 400, "MISSING_SECURITY_HEADERS"
+            raise HTTPException(status_code=400, detail="Missing security headers.")
+
+        try:
+            _verify_signature(auth["signing_secret"], nonce, timestamp, body.ciphertext, signature)
+        except HTTPException as exc:
+            status_code = exc.status_code
+            error_code = "INVALID_SIGNATURE" if exc.status_code == 403 else "INVALID_TIMESTAMP"
+            raise
+
+        if await _nonce_already_used(nonce):
+            status_code, error_code = 409, "REPLAY_DETECTED"
+            raise HTTPException(status_code=409, detail="This request has already been processed (replay detected).")
+
+        try:
+            aesgcm = AESGCM(auth["agent_aes_key"])
+            gcm_nonce = bytes.fromhex(nonce)
+            decrypted = aesgcm.decrypt(gcm_nonce, bytes.fromhex(body.ciphertext), None)
+            summary = json.loads(decrypted.decode())
+        except Exception as exc:
+            status_code, error_code = 400, "DECRYPTION_FAILED"
+            logger.warning("Monitoring decryption failed (run %s): %s", run_id, exc)
+            raise HTTPException(status_code=400, detail="Payload decryption failed.")
+
+        if not isinstance(summary, dict) or not summary.get("session_id"):
+            status_code, error_code = 400, "VALIDATION_FAILED"
+            raise HTTPException(status_code=400, detail="A monitoring summary with 'session_id' is required.")
+
+        await _store_monitoring_session(auth.get("user_id"), project_id, summary)
+
+        status_code, error_code = 200, None
+        return {"stored": True, "session_id": summary.get("session_id"), "run_id": run_id}
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unhandled error in monitoring session (run %s).", run_id)
+        status_code, error_code = 500, "INTERNAL_SERVER_ERROR"
+        raise HTTPException(status_code=500, detail="Internal server error.")
+    finally:
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        ip_raw = http_request.client.host if http_request.client else None
+        asyncio.create_task(_audit_log(
+            project_id=project_id, api_key_hash=api_key_hash,
+            endpoint="/api/v1/monitoring/session", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
 
