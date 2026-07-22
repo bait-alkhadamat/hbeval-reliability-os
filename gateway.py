@@ -84,7 +84,7 @@ logger = logging.getLogger("hb-eval-gateway")
 # intentionally kept in lockstep in this build). If you ever need the
 # protocol version to diverge from the SDK package version, split this
 # into PROTOCOL_VERSION and SOFTWARE_VERSION explicitly.
-PROTOCOL_VERSION = "2.2.0"
+PROTOCOL_VERSION = "2.3.1"
 
 
 # ── 2. Environment ──────────────────────────────────────────────────────────
@@ -1299,6 +1299,166 @@ async def monitoring_session(
         asyncio.create_task(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/api/v1/monitoring/session", method="POST", status_code=status_code,
+            request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
+        ))
+
+
+@app.post("/api/v1/monitoring/trend", tags=["Monitoring"])
+async def monitoring_trend(
+    http_request: Request,
+    body: EncryptedEvaluationRequest,
+    auth: dict = Depends(verify_api_key),
+    _rate: bool = Depends(RateLimiter(times=60, seconds=60, identifier=_api_key_identifier)),
+) -> dict:
+    """Return an agent's reliability trend from its recorded monitoring history.
+
+    SECURITY NOTE: the Gateway holds the service-role key, so row level
+    security does NOT constrain these reads. The owning user_id is therefore
+    filtered explicitly below. Omitting that filter would expose other
+    accounts' trend data — the same class of mistake that made the
+    agent_reliability_trend view unsafe before security_invoker was set on it.
+    """
+    run_id = str(uuid.uuid4())
+    project_id = auth["project_id"]
+    api_key_hash = auth["api_key_hash"]
+    user_id = auth.get("user_id")
+    start_time = time.monotonic()
+    status_code, error_code = 500, "UNKNOWN_ERROR"
+
+    try:
+        nonce = http_request.headers.get("X-HBEval-Nonce", "")
+        timestamp = http_request.headers.get("X-HBEval-Timestamp", "")
+        signature = http_request.headers.get("X-HBEval-Signature", "")
+        if not all([nonce, timestamp, signature]):
+            status_code, error_code = 400, "MISSING_SECURITY_HEADERS"
+            raise HTTPException(status_code=400, detail="Missing security headers.")
+
+        try:
+            _verify_signature(auth["signing_secret"], nonce, timestamp, body.ciphertext, signature)
+        except HTTPException as exc:
+            status_code = exc.status_code
+            error_code = "INVALID_SIGNATURE" if exc.status_code == 403 else "INVALID_TIMESTAMP"
+            raise
+
+        if await _nonce_already_used(nonce):
+            status_code, error_code = 409, "REPLAY_DETECTED"
+            raise HTTPException(status_code=409, detail="This request has already been processed (replay detected).")
+
+        try:
+            aesgcm = AESGCM(auth["agent_aes_key"])
+            decrypted = aesgcm.decrypt(bytes.fromhex(nonce), bytes.fromhex(body.ciphertext), None)
+            payload = json.loads(decrypted.decode())
+        except Exception as exc:
+            status_code, error_code = 400, "DECRYPTION_FAILED"
+            logger.warning("Trend decryption failed (run %s): %s", run_id, exc)
+            raise HTTPException(status_code=400, detail="Payload decryption failed.")
+
+        agent_id = str(payload.get("agent_id", "")).strip()
+        if not agent_id:
+            status_code, error_code = 400, "VALIDATION_FAILED"
+            raise HTTPException(status_code=400, detail="Field 'agent_id' is required.")
+
+        window = max(1, min(int(payload.get("window", 20) or 20), 200))
+
+        if not _supabase:
+            raise HTTPException(status_code=503, detail="Monitoring service unavailable.")
+
+        def _query():
+            q = (_supabase.table("monitoring_sessions")
+                 .select("created_at, step_count, breach_count, halted, "
+                         "pei_live, frr_live, irs_live, ti_live, csi_live")
+                 .eq("agent_id", agent_id))
+            # Explicit owner scoping - see SECURITY NOTE above.
+            if user_id:
+                q = q.eq("user_id", user_id)
+            return q.order("created_at", desc=True).limit(window).execute()
+
+        result = await asyncio.to_thread(_query)
+        rows = result.data or []
+
+        if not rows:
+            status_code, error_code = 200, None
+            return {
+                "agent_id": agent_id,
+                "session_count": 0,
+                "direction": "insufficient_data",
+                "note": ("No monitoring sessions recorded for this agent yet. "
+                         "Run the agent inside client.monitor(...) to build history."),
+                "run_id": run_id,
+            }
+
+        series = list(reversed(rows))
+
+        def _avg(key: str):
+            vals = [r[key] for r in series if r.get(key) is not None]
+            return round(sum(vals) / len(vals), 4) if vals else None
+
+        # Direction compares the first half of the window with the second, and
+        # ONLY where the metric is defined in both halves. An undefined metric
+        # (IRS with no faults, CSI within one session) yields no direction
+        # rather than a fabricated one.
+        half = max(1, len(series) // 2)
+        early, late = series[:half], series[half:]
+
+        def _half_avg(rows_, key):
+            vals = [r[key] for r in rows_ if r.get(key) is not None]
+            return sum(vals) / len(vals) if vals else None
+
+        per_metric = {}
+        improving = declining = 0
+        for key, label in (("pei_live", "pei"), ("frr_live", "frr"),
+                           ("irs_live", "irs"), ("ti_live", "ti"), ("csi_live", "csi")):
+            a, b = _half_avg(early, key), _half_avg(late, key)
+            if a is None or b is None:
+                per_metric[label] = {"direction": "undefined", "early": None, "late": None}
+                continue
+            delta = round(b - a, 4)
+            if delta > 0.01:
+                d = "improving"; improving += 1
+            elif delta < -0.01:
+                d = "declining"; declining += 1
+            else:
+                d = "stable"
+            per_metric[label] = {"direction": d, "early": round(a, 4),
+                                 "late": round(b, 4), "delta": delta}
+
+        if improving and not declining:
+            overall = "improving"
+        elif declining and not improving:
+            overall = "declining"
+        elif improving or declining:
+            overall = "mixed"
+        else:
+            overall = "stable"
+
+        status_code, error_code = 200, None
+        return {
+            "agent_id": agent_id,
+            "session_count": len(series),
+            "window": window,
+            "averages": {
+                "pei": _avg("pei_live"), "frr": _avg("frr_live"),
+                "irs": _avg("irs_live"), "ti": _avg("ti_live"), "csi": _avg("csi_live"),
+            },
+            "total_breaches": sum(r.get("breach_count", 0) or 0 for r in series),
+            "halted_sessions": sum(1 for r in series if r.get("halted")),
+            "per_metric": per_metric,
+            "direction": overall,
+            "run_id": run_id,
+        }
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unhandled error in monitoring trend (run %s).", run_id)
+        status_code, error_code = 500, "INTERNAL_SERVER_ERROR"
+        raise HTTPException(status_code=500, detail="Internal server error.")
+    finally:
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        ip_raw = http_request.client.host if http_request.client else None
+        asyncio.create_task(_audit_log(
+            project_id=project_id, api_key_hash=api_key_hash,
+            endpoint="/api/v1/monitoring/trend", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
 
