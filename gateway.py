@@ -69,7 +69,21 @@ from supabase import Client, create_client
 from engines import HBEvalEngines
 from validation import validate_payload, ValidationError
 from scenario_orchestrator import aggregate_battery_results
-import oauth as oauth_lib  # OAuth 2.1 authorization server for remote MCP
+# Remote MCP is an OPTIONAL access layer. Its absence must never take down
+# evaluation, monitoring or memory — the core of the service. A hard import
+# here would do exactly that: if hbeval_oauth.py is missing from a deployment,
+# the whole Gateway fails to start and every endpoint dies with it.
+#
+# The module is also named hbeval_oauth rather than oauth to avoid colliding
+# with the `oauth` package on PyPI, which a transitive dependency could pull
+# in and shadow.
+try:
+    import hbeval_oauth as oauth_lib
+    _HAS_OAUTH = True
+except ImportError:
+    oauth_lib = None
+    _HAS_OAUTH = False
+
 import edm_guard  # Layer 1: EDM selective-storage guard (persistence governance)
 import hci_edm    # Layer 2: HCI-EDM performance-grounded interpretability
 
@@ -199,6 +213,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 logger.info("CORS allowed origins: %s", _allowed_origins or "(none — fail-closed)")
+
+if not _HAS_OAUTH:
+    logger.warning(
+        "hbeval_oauth.py not found — remote MCP and OAuth endpoints are "
+        "disabled. Every other capability is unaffected. Add the file to the "
+        "repository root to enable remote MCP."
+    )
 
 
 # ── 5. Models ────────────────────────────────────────────────────────────────
@@ -1892,7 +1913,21 @@ from fastapi.responses import RedirectResponse
 from fastapi import Form
 
 
-def _oauth_error(exc: "oauth_lib.OAuthError") -> JSONResponse:
+def _require_oauth() -> None:
+    """Refuse OAuth/MCP routes cleanly when the module is absent.
+
+    503 rather than 500: the capability is unavailable by deployment, not
+    broken by a fault, and the distinction tells an operator to add the file
+    rather than hunt a bug.
+    """
+    if not _HAS_OAUTH:
+        raise HTTPException(
+            status_code=503,
+            detail="Remote MCP is not enabled on this deployment.",
+        )
+
+
+def _oauth_error(exc) -> JSONResponse:
     """RFC 6749 error body.
 
     The code is load-bearing: clients rely on invalid_grant specifically to
@@ -1914,12 +1949,14 @@ async def prm_metadata() -> dict:
     is a deliberate anti-impersonation check — and the most common cause of a
     connection that fails without a useful message.
     """
+    _require_oauth()
     return oauth_lib.protected_resource_metadata("/mcp")
 
 
 @app.get("/.well-known/oauth-authorization-server", tags=["OAuth"])
 async def as_metadata() -> dict:
     """RFC 8414. Everything advertised here is enforced below."""
+    _require_oauth()
     return oauth_lib.authorization_server_metadata()
 
 
@@ -1936,6 +1973,7 @@ async def oauth_register(
     """
     if not _supabase:
         raise HTTPException(status_code=503, detail="Registration unavailable.")
+    _require_oauth()
     try:
         result = await oauth_lib.register_client(_supabase, asyncio.to_thread, body)
         return JSONResponse(status_code=201, content=result)
@@ -1974,6 +2012,7 @@ async def oauth_authorize(
     """
     if not _supabase:
         raise HTTPException(status_code=503, detail="Authorization unavailable.")
+    _require_oauth()
 
     client = await oauth_lib.load_client(_supabase, asyncio.to_thread, client_id)
     if not client:
@@ -2022,6 +2061,7 @@ async def oauth_approve(
     """
     if not _supabase:
         raise HTTPException(status_code=503, detail="Authorization unavailable.")
+    _require_oauth()
 
     supabase_token = str(body.get("supabase_access_token", ""))
     if not supabase_token:
@@ -2092,6 +2132,7 @@ async def oauth_token(
     """
     if not _supabase:
         raise HTTPException(status_code=503, detail="Token service unavailable.")
+    _require_oauth()
 
     try:
         if grant_type == "authorization_code":
@@ -2129,7 +2170,7 @@ async def oauth_revoke(
     token from an invalid one here would turn this into an oracle for probing
     which tokens exist.
     """
-    if not _supabase:
+    if not _HAS_OAUTH or not _supabase:
         return {"revoked": True}
 
     ctx = await oauth_lib.resolve_bearer(_supabase, asyncio.to_thread, f"Bearer {token}")
@@ -2164,6 +2205,7 @@ async def _mcp_auth(http_request: Request) -> dict:
     unauthorized error and stops, instead of discovering the authorization
     server and walking the user through sign-in.
     """
+    _require_oauth()
     if not _supabase:
         raise HTTPException(status_code=503, detail="MCP service unavailable.")
 
