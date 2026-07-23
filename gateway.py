@@ -84,7 +84,7 @@ logger = logging.getLogger("hb-eval-gateway")
 # intentionally kept in lockstep in this build). If you ever need the
 # protocol version to diverge from the SDK package version, split this
 # into PROTOCOL_VERSION and SOFTWARE_VERSION explicitly.
-PROTOCOL_VERSION = "2.3.1"
+PROTOCOL_VERSION = "2.4.0"
 
 
 # ── 2. Environment ──────────────────────────────────────────────────────────
@@ -1171,8 +1171,14 @@ async def _store_monitoring_session(user_id: str | None, project_id: str,
             return None
 
     def _write_session():
-        _supabase.table("monitoring_sessions").insert({
+        # UPSERT, not insert: with live streaming the session row already
+        # exists by the time the closing summary arrives, having been created
+        # by the first progress batch. An insert would collide on session_id
+        # and the final, authoritative numbers would be lost.
+        _supabase.table("monitoring_sessions").upsert({
             "session_id": session_id,
+            "status": "completed",
+            "last_event_at": datetime.now(timezone.utc).isoformat(),
             "user_id": user_id,
             "agent_id": agent_id,
             "started_at": _to_iso(summary.get("started_at")),
@@ -1181,6 +1187,8 @@ async def _store_monitoring_session(user_id: str | None, project_id: str,
             "step_count": min(int(summary.get("step_count", 0) or 0), MAX_MONITORING_STEPS),
             "breach_count": len(breaches),
             "halted": bool(summary.get("halted", False)),
+            "halt_reason": (str(summary["halt_reason"])[:500]
+                            if summary.get("halt_reason") else None),
             "pei_live": _coerce_metric(metrics.get("pei")),
             "frr_live": _coerce_metric(metrics.get("frr")),
             "irs_live": _coerce_metric(metrics.get("irs")),
@@ -1189,7 +1197,7 @@ async def _store_monitoring_session(user_id: str | None, project_id: str,
             "thresholds": summary.get("thresholds") or {},
             "metadata": summary.get("metadata") or {},
             "created_at": datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        }, on_conflict="session_id").execute()
 
     try:
         await asyncio.to_thread(_write_session)
@@ -1219,7 +1227,12 @@ async def _store_monitoring_session(user_id: str | None, project_id: str,
         return
 
     def _write_events():
-        _supabase.table("monitoring_events").insert(rows).execute()
+        # Idempotent by the (session_id, step_index, metric) constraint added
+        # in migration 10: a retried or overlapping batch cannot duplicate a
+        # breach that is already recorded.
+        _supabase.table("monitoring_events").upsert(
+            rows, on_conflict="session_id,step_index,metric"
+        ).execute()
 
     try:
         await asyncio.to_thread(_write_events)
@@ -1299,6 +1312,186 @@ async def monitoring_session(
         asyncio.create_task(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/api/v1/monitoring/session", method="POST", status_code=status_code,
+            request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
+        ))
+
+
+# Live streaming ceiling. The SDK flushes at most every ~2s per session plus
+# an immediate send on each breach, so this allows roughly ten concurrent
+# monitored agents per key before throttling — generous for real use, bounded
+# enough that a runaway loop cannot flood the database.
+MAX_STREAM_EVENTS = 50          # breach events accepted in one batch
+
+
+async def _apply_monitoring_batch(user_id: str | None, batch: dict) -> None:
+    """Upsert an in-flight session and append any breaches it carries.
+
+    Called on every progress batch, so it must stay cheap and idempotent:
+    the same session is written many times over a run, and a retried batch
+    must not duplicate events.
+    """
+    if not _supabase:
+        return
+
+    metrics = batch.get("live_metrics") or {}
+    session_id = str(batch.get("session_id", ""))[:200]
+    agent_id = str(batch.get("agent_id", "unknown-agent"))[:200]
+    status = "active" if batch.get("status") == "active" else "completed"
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    def _to_iso(ts: Any) -> str | None:
+        try:
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            return None
+
+    row = {
+        "session_id": session_id,
+        "user_id": user_id,
+        "agent_id": agent_id,
+        "status": status,
+        "started_at": _to_iso(batch.get("started_at")),
+        "step_count": min(int(batch.get("step_count", 0) or 0), MAX_MONITORING_STEPS),
+        "breach_count": int(batch.get("breach_count", 0) or 0),
+        "halted": bool(batch.get("halted", False)),
+        # Safe Halt cause, when the SDK stopped the run. Truncated because it
+        # is caller-influenced text reaching the database.
+        "halt_reason": (str(batch["halt_reason"])[:500]
+                        if batch.get("halt_reason") else None),
+        # NULL is preserved: an undefined metric (IRS with no faults yet, CSI
+        # within a single session) must not be stored as 0.0, which would read
+        # as a failing score on a dimension that was never measured.
+        "pei_live": _coerce_metric(metrics.get("pei")),
+        "frr_live": _coerce_metric(metrics.get("frr")),
+        "irs_live": _coerce_metric(metrics.get("irs")),
+        "ti_live": _coerce_metric(metrics.get("ti")),
+        "csi_live": _coerce_metric(metrics.get("csi")),
+        "thresholds": batch.get("thresholds") or {},
+        "metadata": batch.get("metadata") or {},
+        "last_event_at": now_iso,
+    }
+    if status == "completed":
+        row["ended_at"] = _to_iso(batch.get("ended_at")) or now_iso
+
+    def _upsert_session():
+        _supabase.table("monitoring_sessions").upsert(
+            row, on_conflict="session_id"
+        ).execute()
+
+    try:
+        await asyncio.to_thread(_upsert_session)
+    except Exception as exc:
+        logger.error("Monitoring stream upsert failed (%s): %s", session_id, exc)
+        return   # without the parent row the events have nothing to attach to
+
+    events = batch.get("events") or []
+    if not isinstance(events, list) or not events:
+        return
+    events = events[:MAX_STREAM_EVENTS]
+
+    rows = []
+    for e in events:
+        try:
+            rows.append({
+                "session_id": session_id,
+                "user_id": user_id,
+                "metric": str(e.get("metric", ""))[:32],
+                "value": float(e.get("value")),
+                "threshold": float(e.get("threshold")),
+                "step_index": int(e.get("step_index", 0)),
+                "occurred_at": _to_iso(e.get("timestamp")) or now_iso,
+            })
+        except (TypeError, ValueError):
+            continue   # skip a malformed breach rather than losing the batch
+
+    if not rows:
+        return
+
+    def _upsert_events():
+        _supabase.table("monitoring_events").upsert(
+            rows, on_conflict="session_id,step_index,metric"
+        ).execute()
+
+    try:
+        await asyncio.to_thread(_upsert_events)
+    except Exception as exc:
+        logger.error("Monitoring stream events failed (%s): %s", session_id, exc)
+
+
+@app.post("/api/v1/monitoring/stream", tags=["Monitoring"])
+async def monitoring_stream(
+    http_request: Request,
+    body: EncryptedEvaluationRequest,
+    auth: dict = Depends(verify_api_key),
+    _rate: bool = Depends(RateLimiter(times=300, seconds=60, identifier=_api_key_identifier)),
+) -> dict:
+    """Receive a live progress batch from an in-flight monitoring session.
+
+    This is what makes the dashboard live rather than retrospective: the SDK
+    pushes progress DURING the run, so an agent working for twenty minutes is
+    visible from its first step instead of only after it stops.
+
+    Not metered against the evaluation quota. The monitored work runs in the
+    user's own process; the platform only stores a small row per batch, which
+    is the same reason basic monitoring is free.
+    """
+    run_id = str(uuid.uuid4())
+    project_id = auth["project_id"]
+    api_key_hash = auth["api_key_hash"]
+    start_time = time.monotonic()
+    status_code, error_code = 500, "UNKNOWN_ERROR"
+
+    try:
+        nonce = http_request.headers.get("X-HBEval-Nonce", "")
+        timestamp = http_request.headers.get("X-HBEval-Timestamp", "")
+        signature = http_request.headers.get("X-HBEval-Signature", "")
+        if not all([nonce, timestamp, signature]):
+            status_code, error_code = 400, "MISSING_SECURITY_HEADERS"
+            raise HTTPException(status_code=400, detail="Missing security headers.")
+
+        try:
+            _verify_signature(auth["signing_secret"], nonce, timestamp, body.ciphertext, signature)
+        except HTTPException as exc:
+            status_code = exc.status_code
+            error_code = "INVALID_SIGNATURE" if exc.status_code == 403 else "INVALID_TIMESTAMP"
+            raise
+
+        # Replay protection applies here too: every batch carries its own
+        # nonce, so a captured batch cannot be resent to corrupt live state.
+        if await _nonce_already_used(nonce):
+            status_code, error_code = 409, "REPLAY_DETECTED"
+            raise HTTPException(status_code=409, detail="This request has already been processed (replay detected).")
+
+        try:
+            aesgcm = AESGCM(auth["agent_aes_key"])
+            decrypted = aesgcm.decrypt(bytes.fromhex(nonce), bytes.fromhex(body.ciphertext), None)
+            batch = json.loads(decrypted.decode())
+        except Exception as exc:
+            status_code, error_code = 400, "DECRYPTION_FAILED"
+            logger.warning("Stream decryption failed (run %s): %s", run_id, exc)
+            raise HTTPException(status_code=400, detail="Payload decryption failed.")
+
+        if not isinstance(batch, dict) or not batch.get("session_id"):
+            status_code, error_code = 400, "VALIDATION_FAILED"
+            raise HTTPException(status_code=400, detail="A batch with 'session_id' is required.")
+
+        await _apply_monitoring_batch(auth.get("user_id"), batch)
+
+        status_code, error_code = 200, None
+        return {"accepted": True, "session_id": batch.get("session_id")}
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unhandled error in monitoring stream (run %s).", run_id)
+        status_code, error_code = 500, "INTERNAL_SERVER_ERROR"
+        raise HTTPException(status_code=500, detail="Internal server error.")
+    finally:
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        ip_raw = http_request.client.host if http_request.client else None
+        asyncio.create_task(_audit_log(
+            project_id=project_id, api_key_hash=api_key_hash,
+            endpoint="/api/v1/monitoring/stream", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
 
@@ -1422,7 +1615,15 @@ async def monitoring_trend(
             per_metric[label] = {"direction": d, "early": round(a, 4),
                                  "late": round(b, 4), "delta": delta}
 
-        if improving and not declining:
+        # A direction requires a comparison. If NO metric was defined in both
+        # halves of the window — the case with a single session, or when every
+        # metric is undefined — there is nothing to compare, and reporting
+        # "stable" would assert a stability the data cannot support. Say so
+        # instead.
+        comparable = sum(1 for v in per_metric.values() if v["direction"] != "undefined")
+        if comparable == 0:
+            overall = "insufficient_data"
+        elif improving and not declining:
             overall = "improving"
         elif declining and not improving:
             overall = "declining"
