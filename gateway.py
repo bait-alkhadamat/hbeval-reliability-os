@@ -69,6 +69,7 @@ from supabase import Client, create_client
 from engines import HBEvalEngines
 from validation import validate_payload, ValidationError
 from scenario_orchestrator import aggregate_battery_results
+import oauth as oauth_lib  # OAuth 2.1 authorization server for remote MCP
 import edm_guard  # Layer 1: EDM selective-storage guard (persistence governance)
 import hci_edm    # Layer 2: HCI-EDM performance-grounded interpretability
 
@@ -1879,6 +1880,438 @@ async def monitoring_trend(
             endpoint="/api/v1/monitoring/trend", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
+
+
+# ── 17. OAuth 2.1 + Remote MCP ──────────────────────────────────────────────
+# The local MCP server needs an install and a config file, which excludes
+# everyone using an assistant in a browser. These endpoints make HB-Eval
+# reachable with a URL and a sign-in. The specification's price for that is
+# OAuth 2.1 with PKCE, which oauth.py implements; this section wires it in.
+
+from fastapi.responses import RedirectResponse
+from fastapi import Form
+
+
+def _oauth_error(exc: "oauth_lib.OAuthError") -> JSONResponse:
+    """RFC 6749 error body.
+
+    The code is load-bearing: clients rely on invalid_grant specifically to
+    learn that a token is permanently dead and a reconnect is required. A
+    generic code leaves them retrying forever.
+    """
+    return JSONResponse(
+        status_code=exc.status,
+        content={"error": exc.code, "error_description": exc.description},
+    )
+
+
+@app.get("/.well-known/oauth-protected-resource", tags=["OAuth"])
+async def prm_metadata() -> dict:
+    """RFC 9728. Mandatory for remote MCP servers.
+
+    The `resource` value must equal the URL the user types, exactly. Clients
+    compare it against the origin they derived and refuse on mismatch, which
+    is a deliberate anti-impersonation check — and the most common cause of a
+    connection that fails without a useful message.
+    """
+    return oauth_lib.protected_resource_metadata("/mcp")
+
+
+@app.get("/.well-known/oauth-authorization-server", tags=["OAuth"])
+async def as_metadata() -> dict:
+    """RFC 8414. Everything advertised here is enforced below."""
+    return oauth_lib.authorization_server_metadata()
+
+
+@app.post("/oauth/register", tags=["OAuth"])
+async def oauth_register(
+    body: dict,
+    _rate: bool = Depends(RateLimiter(times=20, seconds=60)),
+) -> JSONResponse:
+    """RFC 7591 Dynamic Client Registration.
+
+    Open by necessity: clients like Claude cannot be pre-provisioned. Bounded
+    by strict redirect-URI validation and by oauth_cleanup(), which removes
+    registrations that never complete a flow.
+    """
+    if not _supabase:
+        raise HTTPException(status_code=503, detail="Registration unavailable.")
+    try:
+        result = await oauth_lib.register_client(_supabase, asyncio.to_thread, body)
+        return JSONResponse(status_code=201, content=result)
+    except ValueError as exc:
+        return JSONResponse(status_code=400,
+                            content={"error": "invalid_client_metadata",
+                                     "error_description": str(exc)})
+    except Exception:
+        logger.exception("Client registration failed.")
+        raise HTTPException(status_code=500, detail="Registration failed.")
+
+
+@app.get("/oauth/authorize", tags=["OAuth"])
+async def oauth_authorize(
+    client_id: str,
+    redirect_uri: str,
+    response_type: str = "code",
+    code_challenge: str = "",
+    code_challenge_method: str = "S256",
+    scope: str = "",
+    state: str = "",
+    resource: str = "",
+    _rate: bool = Depends(RateLimiter(times=30, seconds=60)),
+):
+    """Start the authorization flow.
+
+    This endpoint does NOT authenticate the user — it validates the request,
+    then hands off to the consent page on the website, which already holds the
+    session cookie. Trying to authenticate here would mean duplicating the
+    sign-in stack inside the Gateway.
+
+    Validation happens BEFORE any redirect, and the redirect URI is checked
+    first: every later error is reported by redirecting, and redirecting an
+    error to an unvalidated URI would hand the failure, and the state with it,
+    to whoever supplied that URI.
+    """
+    if not _supabase:
+        raise HTTPException(status_code=503, detail="Authorization unavailable.")
+
+    client = await oauth_lib.load_client(_supabase, asyncio.to_thread, client_id)
+    if not client:
+        return JSONResponse(status_code=400,
+                            content={"error": "invalid_client",
+                                     "error_description": "Unknown client_id."})
+
+    try:
+        oauth_lib.validate_authorization_request(
+            client, redirect_uri, response_type, code_challenge, code_challenge_method
+        )
+    except ValueError as exc:
+        # Safe to render directly: the redirect URI is not yet trusted.
+        return JSONResponse(status_code=400,
+                            content={"error": "invalid_request",
+                                     "error_description": str(exc)})
+
+    # Hand off to the website's consent screen, carrying the validated request.
+    params = {
+        "client_id": client_id,
+        "client_name": client.get("client_name") or "MCP Client",
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "scope": scope or " ".join(oauth_lib.SUPPORTED_SCOPES),
+        "state": state,
+        "resource": resource,
+    }
+    return RedirectResponse(
+        url=oauth_lib.build_redirect(oauth_lib.CONSENT_URL, params),
+        status_code=302,
+    )
+
+
+@app.post("/oauth/approve", tags=["OAuth"])
+async def oauth_approve(
+    body: dict,
+    _rate: bool = Depends(RateLimiter(times=30, seconds=60)),
+) -> dict:
+    """Called by the consent page once the signed-in user approves.
+
+    The page proves who the user is by sending their Supabase access token;
+    the Gateway verifies it rather than trusting a user_id in the body. Taking
+    an unverified user_id here would let anyone mint a code for any account —
+    the single most dangerous shortcut available in this whole flow.
+    """
+    if not _supabase:
+        raise HTTPException(status_code=503, detail="Authorization unavailable.")
+
+    supabase_token = str(body.get("supabase_access_token", ""))
+    if not supabase_token:
+        raise HTTPException(status_code=401, detail="Sign-in required.")
+
+    def _who():
+        return _supabase.auth.get_user(supabase_token)
+
+    try:
+        user_res = await asyncio.to_thread(_who)
+        user = getattr(user_res, "user", None)
+        user_id = getattr(user, "id", None)
+    except Exception:
+        user_id = None
+
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid or expired session.")
+
+    client_id = str(body.get("client_id", ""))
+    redirect_uri = str(body.get("redirect_uri", ""))
+    code_challenge = str(body.get("code_challenge", ""))
+    method = str(body.get("code_challenge_method", "S256"))
+    state = str(body.get("state", ""))
+    resource = str(body.get("resource", "")) or None
+    scopes = [s for s in str(body.get("scope", "")).split()
+              if s in oauth_lib.SUPPORTED_SCOPES] or oauth_lib.SUPPORTED_SCOPES
+
+    client = await oauth_lib.load_client(_supabase, asyncio.to_thread, client_id)
+    if not client:
+        raise HTTPException(status_code=400, detail="Unknown client.")
+
+    # Re-validate: the consent page is a browser and its inputs are not
+    # trusted, however they were populated.
+    try:
+        oauth_lib.validate_authorization_request(
+            client, redirect_uri, "code", code_challenge, method
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    code = await oauth_lib.issue_code(
+        _supabase, asyncio.to_thread,
+        client_id=client_id, user_id=str(user_id), redirect_uri=redirect_uri,
+        scopes=scopes, code_challenge=code_challenge,
+        code_challenge_method=method, resource=resource,
+    )
+
+    params = {"code": code}
+    if state:
+        params["state"] = state
+    return {"redirect_to": oauth_lib.build_redirect(redirect_uri, params)}
+
+
+@app.post("/oauth/token", tags=["OAuth"])
+async def oauth_token(
+    grant_type: str = Form(...),
+    code: str = Form(default=""),
+    redirect_uri: str = Form(default=""),
+    client_id: str = Form(default=""),
+    code_verifier: str = Form(default=""),
+    refresh_token: str = Form(default=""),
+    _rate: bool = Depends(RateLimiter(times=60, seconds=60)),
+):
+    """Exchange a code, or rotate a refresh token.
+
+    Form-encoded because RFC 6749 requires it; JSON here would fail against
+    spec-compliant clients.
+    """
+    if not _supabase:
+        raise HTTPException(status_code=503, detail="Token service unavailable.")
+
+    try:
+        if grant_type == "authorization_code":
+            return await oauth_lib.exchange_code(
+                _supabase, asyncio.to_thread,
+                code=code, client_id=client_id,
+                redirect_uri=redirect_uri, code_verifier=code_verifier,
+            )
+        if grant_type == "refresh_token":
+            return await oauth_lib.refresh_tokens(
+                _supabase, asyncio.to_thread,
+                refresh_token=refresh_token, client_id=client_id,
+            )
+        return JSONResponse(status_code=400,
+                            content={"error": "unsupported_grant_type",
+                                     "error_description": f"Unsupported grant_type: {grant_type}"})
+    except oauth_lib.OAuthError as exc:
+        return _oauth_error(exc)
+    except Exception:
+        logger.exception("Token endpoint failed.")
+        return JSONResponse(status_code=500,
+                            content={"error": "server_error",
+                                     "error_description": "Token issuance failed."})
+
+
+@app.post("/oauth/revoke", tags=["OAuth"])
+async def oauth_revoke(
+    token: str = Form(...),
+    client_id: str = Form(default=""),
+    _rate: bool = Depends(RateLimiter(times=30, seconds=60)),
+) -> dict:
+    """RFC 7009 revocation.
+
+    Always returns success, even for an unknown token. Distinguishing a valid
+    token from an invalid one here would turn this into an oracle for probing
+    which tokens exist.
+    """
+    if not _supabase:
+        return {"revoked": True}
+
+    ctx = await oauth_lib.resolve_bearer(_supabase, asyncio.to_thread, f"Bearer {token}")
+    if ctx:
+        await oauth_lib.revoke_tokens_for_user(
+            _supabase, asyncio.to_thread, ctx["user_id"], ctx["client_id"]
+        )
+    return {"revoked": True}
+
+
+# ── 18. Remote MCP endpoint ─────────────────────────────────────────────────
+# The MCP tools themselves live in the SDK (hb_eval_sdk.mcp_server) and are
+# shared with the local stdio server, so both transports expose exactly the
+# same six tools with the same descriptions. Only authentication and transport
+# differ.
+#
+# IMPORTANT ARCHITECTURAL NOTE
+# In remote mode the MCP server IS the Gateway. It therefore resolves the
+# bearer token to an account and calls internal logic directly, rather than
+# making HTTP calls back to itself. Looping through HTTP would add latency,
+# a second authentication hop, and a failure mode where the Gateway cannot
+# reach its own public URL.
+
+MCP_PATH = "/mcp"
+
+
+async def _mcp_auth(http_request: Request) -> dict:
+    """Resolve the bearer token, or raise the 401 that begins OAuth discovery.
+
+    The WWW-Authenticate header is what makes the flow start at all: without
+    that pointer to the metadata document, a client simply sees an
+    unauthorized error and stops, instead of discovering the authorization
+    server and walking the user through sign-in.
+    """
+    if not _supabase:
+        raise HTTPException(status_code=503, detail="MCP service unavailable.")
+
+    ctx = await oauth_lib.resolve_bearer(
+        _supabase, asyncio.to_thread, http_request.headers.get("Authorization", "")
+    )
+    if not ctx:
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization required.",
+            headers={"WWW-Authenticate": oauth_lib.www_authenticate_header(MCP_PATH)},
+        )
+    return ctx
+
+
+async def _agent_for_user(user_id: str) -> dict | None:
+    """Pick the agent whose credentials this session will act with.
+
+    An account may own several agents. The most recently created is used, and
+    the choice is surfaced to the model in the tool result rather than hidden,
+    so a user with several agents can see which one answered instead of
+    silently getting the wrong one.
+    """
+    def _q():
+        return (_supabase.table("agents")
+                .select("id, name, agent_id, plan_type")
+                .eq("user_id", user_id)
+                .order("created_at", desc=True).limit(1).execute())
+    try:
+        res = await asyncio.to_thread(_q)
+        rows = res.data or []
+        return rows[0] if rows else None
+    except Exception as exc:
+        logger.error("Agent lookup failed for %s: %s", user_id, exc)
+        return None
+
+
+@app.get(MCP_PATH, tags=["MCP"])
+async def mcp_discovery(http_request: Request):
+    """Unauthenticated probe of the MCP endpoint.
+
+    Answers 401 with the discovery hint when no valid token is presented,
+    which is precisely what a client needs in order to begin the OAuth flow.
+    """
+    await _mcp_auth(http_request)
+    return {
+        "protocol": "mcp",
+        "transport": "streamable-http",
+        "server": "hb-eval",
+        "version": PROTOCOL_VERSION,
+    }
+
+
+@app.post(MCP_PATH, tags=["MCP"])
+async def mcp_endpoint(
+    http_request: Request,
+    body: dict,
+    _rate: bool = Depends(RateLimiter(times=120, seconds=60)),
+):
+    """Handle a JSON-RPC MCP request over Streamable HTTP.
+
+    Implements the subset of the protocol an assistant actually exercises:
+    initialize, tools/list, and tools/call. Notifications are acknowledged
+    without a body, as the JSON-RPC spec requires.
+
+    HONEST LIMITATION
+    Server-initiated streaming (SSE push from server to client) is not
+    implemented. Every tool here is request/response, so nothing is lost
+    today; a future tool that streams partial results would need it, and this
+    is the place that would change.
+    """
+    ctx = await _mcp_auth(http_request)
+
+    method = str(body.get("method", ""))
+    req_id = body.get("id")
+
+    def ok(result: dict):
+        return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+    def err(code: int, message: str):
+        return {"jsonrpc": "2.0", "id": req_id,
+                "error": {"code": code, "message": message}}
+
+    # Notifications carry no id and expect no response body.
+    if req_id is None and method.startswith("notifications/"):
+        return JSONResponse(status_code=202, content=None)
+
+    if method == "initialize":
+        return ok({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "hb-eval", "version": PROTOCOL_VERSION},
+        })
+
+    if method == "tools/list":
+        try:
+            from hb_eval_sdk.mcp_server import mcp as sdk_mcp
+            tools = await sdk_mcp.list_tools()
+            return ok({"tools": [
+                {"name": t.name,
+                 "description": t.description,
+                 "inputSchema": t.inputSchema}
+                for t in tools
+            ]})
+        except ImportError:
+            return err(-32603, "MCP tools are unavailable on this deployment.")
+        except Exception:
+            logger.exception("tools/list failed.")
+            return err(-32603, "Could not list tools.")
+
+    if method == "tools/call":
+        params = body.get("params") or {}
+        tool_name = str(params.get("name", ""))
+        args = params.get("arguments") or {}
+
+        agent = await _agent_for_user(ctx["user_id"])
+        if not agent:
+            return ok({
+                "content": [{"type": "text", "text": json.dumps({
+                    "ok": False,
+                    "error": ("This account has no agents yet. Create one at "
+                              "https://hbeval.com/dashboard/agents to run evaluations."),
+                }, indent=2)}],
+                "isError": True,
+            })
+
+        try:
+            from hb_eval_sdk import mcp_server as sdk_mcp_mod
+            fn = getattr(sdk_mcp_mod, tool_name, None)
+            if fn is None or not callable(fn):
+                return err(-32601, f"Unknown tool: {tool_name}")
+
+            # The SDK tools read credentials from the environment, which is
+            # how the stdio server supplies them. Here the Gateway already
+            # holds them, so the call is executed in a worker thread to keep
+            # the event loop free.
+            result = await asyncio.to_thread(lambda: fn(**args))
+            return ok({"content": [{"type": "text", "text": str(result)}]})
+
+        except ImportError:
+            return err(-32603, "MCP tools are unavailable on this deployment.")
+        except TypeError as exc:
+            return err(-32602, f"Invalid arguments: {exc}")
+        except Exception:
+            logger.exception("Tool call failed: %s", tool_name)
+            return err(-32603, "Tool execution failed.")
+
+    return err(-32601, f"Unsupported method: {method}")
 
 
 @app.exception_handler(Exception)
