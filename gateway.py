@@ -1297,6 +1297,12 @@ async def monitoring_session(
 
         await _store_monitoring_session(auth.get("user_id"), project_id, summary)
 
+        # Anonymous aggregate contribution, only if this account opted in.
+        # Fired as a background task: the user's own session is already
+        # stored, and a slow or failing contribution must not delay their
+        # response.
+        asyncio.create_task(_contribute_to_observatory(auth.get("user_id"), summary))
+
         status_code, error_code = 200, None
         return {"stored": True, "session_id": summary.get("session_id"), "run_id": run_id}
 
@@ -1416,6 +1422,217 @@ async def _apply_monitoring_batch(user_id: str | None, batch: dict) -> None:
         await asyncio.to_thread(_upsert_events)
     except Exception as exc:
         logger.error("Monitoring stream events failed (%s): %s", session_id, exc)
+
+
+# ── 16. Observatory ─────────────────────────────────────────────────────────
+# Publishes AGGREGATE reliability statistics so the field can see what
+# operational reliability looks like in deployment, not only in controlled
+# studies. See migration 11 for the full privacy model.
+#
+# The salt below turns an account id into a stable but non-reversible
+# contributor token, used only so k-anonymity can count distinct
+# contributors. It lives in the environment, never in the database, so a
+# database dump on its own cannot be correlated back to accounts.
+#
+# If unset, contribution is DISABLED entirely rather than falling back to an
+# unsalted hash. An unsalted hash of a UUID is trivially reversible by anyone
+# holding the user list, which would defeat the whole anonymisation.
+_OBSERVATORY_SALT = os.environ.get("OBSERVATORY_SALT", "")
+if not _OBSERVATORY_SALT:
+    logger.warning(
+        "OBSERVATORY_SALT is not set — Observatory contribution is disabled. "
+        "Set it to enable anonymous aggregate publishing."
+    )
+
+
+def _contributor_hash(user_id: str) -> str:
+    """Stable, non-reversible token for one account."""
+    return hashlib.sha256(f"{_OBSERVATORY_SALT}:{user_id}".encode()).hexdigest()
+
+
+def _step_bucket(step_count: int) -> str:
+    """Coarse run size. Bucketed so an unusually long run cannot single
+    itself out by its exact step count."""
+    if step_count <= 5:
+        return "1-5"
+    if step_count <= 20:
+        return "6-20"
+    if step_count <= 100:
+        return "21-100"
+    return "100+"
+
+
+async def _has_observatory_consent(user_id: str | None) -> bool:
+    """Whether this account has explicitly opted in.
+
+    Fail-closed everywhere: no user, no row, an error, or an explicit false
+    all mean NO. Consent is the one place where a transient failure must not
+    be resolved in favour of publishing.
+    """
+    if not _supabase or not user_id or not _OBSERVATORY_SALT:
+        return False
+
+    def _q():
+        return (_supabase.table("observatory_consent")
+                .select("enabled").eq("user_id", user_id).execute())
+    try:
+        res = await asyncio.to_thread(_q)
+        rows = res.data or []
+        return bool(rows and rows[0].get("enabled"))
+    except Exception as exc:
+        logger.error("Observatory consent check failed for %s: %s", user_id, exc)
+        return False
+
+
+async def _contribute_to_observatory(user_id: str | None, summary: dict) -> None:
+    """Write one anonymised contribution from a completed session.
+
+    Identifiers are dropped HERE, at write time, so the public table never
+    holds them at all. agent_id, metadata and step labels are deliberately
+    absent: the first two identify, and step labels leak business logic.
+    """
+    if not await _has_observatory_consent(user_id):
+        return
+
+    metrics = summary.get("live_metrics") or {}
+    breaches = summary.get("breaches") or []
+
+    # Distinct metric names only — never step labels.
+    breached = sorted({str(b.get("metric", ""))[:16]
+                       for b in breaches if b.get("metric")})
+
+    row = {
+        "contributor_hash": _contributor_hash(str(user_id)),
+        "pei": _coerce_metric(metrics.get("pei")),
+        "frr": _coerce_metric(metrics.get("frr")),
+        "irs": _coerce_metric(metrics.get("irs")),
+        "ti": _coerce_metric(metrics.get("ti")),
+        "csi": _coerce_metric(metrics.get("csi")),
+        "step_bucket": _step_bucket(int(summary.get("step_count", 0) or 0)),
+        "breach_count": min(int(summary.get("breach_count", 0) or 0), 10_000),
+        "halted": bool(summary.get("halted", False)),
+        "breached_metrics": breached,
+        "source": "live",
+    }
+
+    def _write():
+        _supabase.table("observatory_contributions").insert(row).execute()
+
+    try:
+        await asyncio.to_thread(_write)
+    except Exception as exc:
+        # Never let a contribution failure affect the user's own session,
+        # which has already been stored by this point.
+        logger.error("Observatory contribution failed: %s", exc)
+
+
+@app.get("/api/v1/observatory", tags=["Observatory"])
+async def observatory_summary(
+    _rate: bool = Depends(RateLimiter(times=60, seconds=60)),
+) -> dict:
+    """Public reliability statistics across contributing deployments.
+
+    Intentionally UNAUTHENTICATED: the Observatory is public, and requiring a
+    key would defeat its purpose as a citable reference.
+
+    Safety rests on the database function rather than on this handler: it
+    returns aggregates only and refuses to return anything until enough
+    distinct accounts are represented. This endpoint cannot read the
+    underlying table even if it tried — direct access is revoked for all
+    client roles in migration 11.
+    """
+    if not _supabase:
+        raise HTTPException(status_code=503, detail="Observatory unavailable.")
+
+    def _q():
+        return _supabase.rpc("observatory_summary", {}).execute()
+
+    try:
+        res = await asyncio.to_thread(_q)
+        data = res.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not data:
+            return {"available": False, "reason": "no_data"}
+        return data
+    except Exception:
+        logger.exception("Observatory summary failed.")
+        raise HTTPException(status_code=500, detail="Could not load statistics.")
+
+
+@app.post("/api/v1/observatory/consent", tags=["Observatory"])
+async def observatory_consent(
+    http_request: Request,
+    body: EncryptedEvaluationRequest,
+    auth: dict = Depends(verify_api_key),
+    _rate: bool = Depends(RateLimiter(times=30, seconds=60, identifier=_api_key_identifier)),
+) -> dict:
+    """Set this account's Observatory contribution preference.
+
+    Signed and encrypted like every other authenticated call, so consent
+    cannot be flipped on by a forged request.
+    """
+    run_id = str(uuid.uuid4())
+    user_id = auth.get("user_id")
+    project_id = auth["project_id"]
+    api_key_hash = auth["api_key_hash"]
+    start_time = time.monotonic()
+    status_code, error_code = 500, "UNKNOWN_ERROR"
+
+    try:
+        nonce = http_request.headers.get("X-HBEval-Nonce", "")
+        timestamp = http_request.headers.get("X-HBEval-Timestamp", "")
+        signature = http_request.headers.get("X-HBEval-Signature", "")
+        if not all([nonce, timestamp, signature]):
+            status_code, error_code = 400, "MISSING_SECURITY_HEADERS"
+            raise HTTPException(status_code=400, detail="Missing security headers.")
+
+        _verify_signature(auth["signing_secret"], nonce, timestamp, body.ciphertext, signature)
+
+        if await _nonce_already_used(nonce):
+            status_code, error_code = 409, "REPLAY_DETECTED"
+            raise HTTPException(status_code=409, detail="This request has already been processed (replay detected).")
+
+        try:
+            aesgcm = AESGCM(auth["agent_aes_key"])
+            decrypted = aesgcm.decrypt(bytes.fromhex(nonce), bytes.fromhex(body.ciphertext), None)
+            payload = json.loads(decrypted.decode())
+        except Exception:
+            status_code, error_code = 400, "DECRYPTION_FAILED"
+            raise HTTPException(status_code=400, detail="Payload decryption failed.")
+
+        if not user_id:
+            status_code, error_code = 400, "NO_ACCOUNT"
+            raise HTTPException(status_code=400, detail="No account is associated with this key.")
+
+        enabled = bool(payload.get("enabled", False))
+
+        def _upsert():
+            _supabase.table("observatory_consent").upsert({
+                "user_id": user_id,
+                "enabled": enabled,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="user_id").execute()
+
+        await asyncio.to_thread(_upsert)
+
+        status_code, error_code = 200, None
+        return {"enabled": enabled, "run_id": run_id}
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Observatory consent failed (run %s).", run_id)
+        status_code, error_code = 500, "INTERNAL_SERVER_ERROR"
+        raise HTTPException(status_code=500, detail="Internal server error.")
+    finally:
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+        ip_raw = http_request.client.host if http_request.client else None
+        asyncio.create_task(_audit_log(
+            project_id=project_id, api_key_hash=api_key_hash,
+            endpoint="/api/v1/observatory/consent", method="POST", status_code=status_code,
+            request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
+        ))
 
 
 @app.post("/api/v1/monitoring/stream", tags=["Monitoring"])
