@@ -11,6 +11,7 @@
 # ── Web framework ──────────────────────────────────────────────────────────
 fastapi>=0.111,<1
 uvicorn[standard]>=0.30,<1
+python-multipart>=0.0.6
 
 # ── Rate limiting (PINNED — see note above) ────────────────────────────────
 fastapi-limiter==0.1.6
