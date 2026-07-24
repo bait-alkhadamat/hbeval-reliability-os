@@ -79,9 +79,11 @@ from scenario_orchestrator import aggregate_battery_results
 # in and shadow.
 try:
     import hbeval_oauth as oauth_lib
+    import mcp_tools
     _HAS_OAUTH = True
 except ImportError:
     oauth_lib = None
+    mcp_tools = None
     _HAS_OAUTH = False
 
 import edm_guard  # Layer 1: EDM selective-storage guard (persistence governance)
@@ -2182,10 +2184,10 @@ async def oauth_revoke(
 
 
 # ── 18. Remote MCP endpoint ─────────────────────────────────────────────────
-# The MCP tools themselves live in the SDK (hb_eval_sdk.mcp_server) and are
-# shared with the local stdio server, so both transports expose exactly the
-# same six tools with the same descriptions. Only authentication and transport
-# differ.
+# The tools are defined in mcp_tools.py and call Gateway internals directly.
+# They are deliberately NOT imported from the client SDK: the Gateway does not
+# install that package, and the SDK's tools reach the Gateway over HTTP, which
+# in remote mode would mean the Gateway calling itself.
 #
 # IMPORTANT ARCHITECTURAL NOTE
 # In remote mode the MCP server IS the Gateway. It therefore resolves the
@@ -2301,57 +2303,45 @@ async def mcp_endpoint(
         })
 
     if method == "tools/list":
-        try:
-            from hb_eval_sdk.mcp_server import mcp as sdk_mcp
-            tools = await sdk_mcp.list_tools()
-            return ok({"tools": [
-                {"name": t.name,
-                 "description": t.description,
-                 "inputSchema": t.inputSchema}
-                for t in tools
-            ]})
-        except ImportError:
-            return err(-32603, "MCP tools are unavailable on this deployment.")
-        except Exception:
-            logger.exception("tools/list failed.")
-            return err(-32603, "Could not list tools.")
+        # Defined natively in mcp_tools.py, NOT imported from the client SDK.
+        # The Gateway does not install that package, and even if it did, those
+        # tools call the Gateway over HTTP - which here would mean calling
+        # ourselves.
+        return ok({"tools": mcp_tools.TOOL_DEFINITIONS})
 
     if method == "tools/call":
         params = body.get("params") or {}
         tool_name = str(params.get("name", ""))
         args = params.get("arguments") or {}
 
+        # Fetched, but not required: get_reliability_metrics and list_my_agents
+        # are useful to an account with no agents yet, and refusing them would
+        # make the connector look broken on first use.
         agent = await _agent_for_user(ctx["user_id"])
-        if not agent:
-            return ok({
-                "content": [{"type": "text", "text": json.dumps({
-                    "ok": False,
-                    "error": ("This account has no agents yet. Create one at "
-                              "https://hbeval.com/dashboard/agents to run evaluations."),
-                }, indent=2)}],
-                "isError": True,
-            })
 
+        # Gateway internals are passed in rather than imported by mcp_tools,
+        # which keeps that module free of a circular import back into this one.
+        deps = {
+            "hci_explain": getattr(hci_edm, "explain", None),
+            "aggregate_battery_results": aggregate_battery_results,
+        }
         try:
-            from hb_eval_sdk import mcp_server as sdk_mcp_mod
-            fn = getattr(sdk_mcp_mod, tool_name, None)
-            if fn is None or not callable(fn):
-                return err(-32601, f"Unknown tool: {tool_name}")
-
-            # The SDK tools read credentials from the environment, which is
-            # how the stdio server supplies them. Here the Gateway already
-            # holds them, so the call is executed in a worker thread to keep
-            # the event loop free.
-            result = await asyncio.to_thread(lambda: fn(**args))
-            return ok({"content": [{"type": "text", "text": str(result)}]})
-
+            from verified_runner import run_verified_battery
+            deps["run_verified_battery"] = run_verified_battery
         except ImportError:
-            return err(-32603, "MCP tools are unavailable on this deployment.")
-        except TypeError as exc:
-            return err(-32602, f"Invalid arguments: {exc}")
-        except Exception:
-            logger.exception("Tool call failed: %s", tool_name)
-            return err(-32603, "Tool execution failed.")
+            deps["run_verified_battery"] = None
+
+        result = await mcp_tools.call_tool(
+            tool_name, args,
+            supabase=_supabase, to_thread=asyncio.to_thread,
+            user_id=ctx["user_id"], agent=agent, deps=deps,
+        )
+        # isError is derived from the payload the tool itself returned, so a
+        # refusal (wrong plan, missing consent) reads as a failed call to the
+        # model rather than a successful one with an error inside it.
+        is_error = '"ok": false' in result
+        return ok({"content": [{"type": "text", "text": result}],
+                   "isError": is_error})
 
     return err(-32601, f"Unsupported method: {method}")
 
