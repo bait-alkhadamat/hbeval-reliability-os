@@ -108,7 +108,8 @@ TOOL_DEFINITIONS: list[dict] = [
     {
         "name": "list_my_agents",
         "description": (
-            "List the agents on this account, with their plan and usage. Use "
+            "List the agents on this account, with the plan and the account-wide "
+            "evaluation usage they share. Use "
             "first when someone refers to 'my agent' without naming one, or to "
             "find the right agent_id for another tool."
         ),
@@ -260,17 +261,61 @@ async def call_tool(name: str, args: dict, *, supabase: Any, to_thread: Any,
         return _err(f"The tool '{name}' failed. The incident has been logged.")
 
 
+_ACCOUNT_LIMITS = {"free": 500, "pro": 5_000, "enterprise": 2_147_483_647}
+
+
 async def _list_agents(supabase, to_thread, user_id: str) -> str:
-    def _q():
+    """List the account's agents, with usage read from the right place.
+
+    The monthly pool belongs to the ACCOUNT and is shared by every agent it
+    owns (migration 08). The per-agent evaluations_this_month column stopped
+    being maintained when that change landed, so reporting it here showed zero
+    no matter how much the account had actually used — which reads as a broken
+    counter rather than as the stale column it is.
+    """
+    def _agents():
         return (supabase.table("agents")
-                .select("agent_id, name, plan_type, evaluations_this_month, evaluation_limit")
+                .select("agent_id, name, plan_type, is_active")
                 .eq("user_id", user_id)
                 .order("created_at", desc=True).limit(25).execute())
-    res = await to_thread(_q)
+    res = await to_thread(_agents)
     rows = res.data or []
     if not rows:
-        return _ok({"agents": [], "note": "This account has no agents yet."})
-    return _ok({"agents": rows, "count": len(rows)})
+        return _ok({"agents": [], "note": "This account has no agents yet. "
+                                          "Create one at https://hbeval.com/dashboard/agents"})
+
+    def _quota():
+        return (supabase.table("account_usage")
+                .select("plan_type, evaluation_limit, evaluations_this_month, evaluations_today")
+                .eq("user_id", user_id).execute())
+    used = limit = None
+    plan = rows[0].get("plan_type", "free")
+    try:
+        qres = await to_thread(_quota)
+        qrows = qres.data or []
+        if qrows:
+            q = qrows[0]
+            plan = q.get("plan_type") or plan
+            used = q.get("evaluations_this_month", 0) or 0
+            limit = q.get("evaluation_limit") or _ACCOUNT_LIMITS.get(plan, 500)
+    except Exception as exc:
+        logger.error("Account quota read failed for %s: %s", user_id, exc)
+
+    if used is None:
+        used, limit = 0, _ACCOUNT_LIMITS.get(plan, 500)
+
+    return _ok({
+        "agents": rows,
+        "count": len(rows),
+        "account_usage": {
+            "plan": plan,
+            "evaluations_this_month": used,
+            "monthly_limit": limit,
+            "note": ("This pool is shared across every agent on the account. "
+                     "Runtime monitoring sessions are NOT counted - they run on "
+                     "the user's own machine."),
+        },
+    })
 
 
 async def _trend(supabase, to_thread, user_id: str, agent_id: str, window: int) -> str:
