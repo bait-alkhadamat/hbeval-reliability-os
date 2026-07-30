@@ -192,6 +192,63 @@ def compute_irs(response: str, fault_type: str) -> float | None:
     return 0.0
 
 
+# ── Scoring method, declared ─────────────────────────────────────────────────
+# Every score this module returns is a HEURISTIC over response text, not an
+# LLM-judge verdict. The paper's reported calibration (TI: Pearson r = 0.89,
+# Cohen's kappa = 0.82 against expert annotation) belongs to the LLM-judge mode
+# and does NOT transfer to these figures. Reporting them interchangeably would
+# be an undisclosed divergence between what the paper describes and what the
+# platform computes, so the mode is attached to every scored record and must be
+# surfaced wherever the scores are.
+SCORING_METHOD = "heuristic_v2"
+
+# ── Keyword-stuffing resistance ──────────────────────────────────────────────
+# Measured before this was added: appending a string of bare connectives
+# ("Step 1: because therefore consequently. However, based on previous
+# approach, alternative fallback despite this...") to an otherwise unchanged
+# answer moved PEI 0.212 -> 1.0, FRR 0.0 -> 1.0 and TI 0.0 -> 5.0. Substring
+# presence alone is trivially forged.
+#
+# Stuffing has a measurable signature that genuine prose does not: connectives
+# appear at an implausible density relative to substantive words. Ordinary
+# technical writing carries them at roughly 3-8% of tokens; a padded block runs
+# far above that. The penalty scales the score rather than zeroing it, because
+# a verbose-but-genuine answer should be dampened, not failed.
+MAX_PLAUSIBLE_MARKER_DENSITY = 0.18   # markers / words before penalty applies
+MIN_SUBSTANTIVE_WORDS = 12            # below this, no score is meaningful
+
+
+def _marker_density(response: str, markers: list[str]) -> tuple[float, int]:
+    """Marker occurrences per word, and the substantive word count."""
+    words = [w for w in response.lower().split() if len(w) > 2]
+    if not words:
+        return 0.0, 0
+    hits = 0
+    lowered = response.lower()
+    for m in markers:
+        hits += lowered.count(m)
+    return hits / len(words), len(words)
+
+
+def stuffing_multiplier(response: str, markers: list[str]) -> float:
+    """A factor in [0, 1] penalising implausible connective density.
+
+    Returns 1.0 for normal prose. Falls toward 0 as density rises past what
+    genuine writing exhibits, so padding a response with markers now costs more
+    than it gains.
+    """
+    density, n_words = _marker_density(response, markers)
+    if n_words < MIN_SUBSTANTIVE_WORDS:
+        # Too short to judge: refuse to reward it rather than guess.
+        return 0.0
+    if density <= MAX_PLAUSIBLE_MARKER_DENSITY:
+        return 1.0
+    # Linear decay: at twice the plausible density the score is halved, at
+    # three times it is near zero.
+    excess = density / MAX_PLAUSIBLE_MARKER_DENSITY
+    return round(max(0.0, 1.0 - (excess - 1.0)), 4)
+
+
 def compute_ti(response: str) -> float:
     """Traceability Index — reasoning transparency via structural markers.
 
@@ -206,6 +263,13 @@ def compute_ti(response: str) -> float:
     resp_lower = response.lower()
     found = sum(1 for m in _TI_MARKERS if m in resp_lower)
     score_01 = min(1.0, found / 3.0)     # saturate at 3 distinct markers
+    # Dampened by connective density: distinct markers present in genuine prose
+    # score fully, the same markers stuffed into filler do not.
+    # Density measured over the FULL cue vocabulary, not only TI markers: a
+    # padded block stuffs every cue word it knows, which dilutes any single
+    # marker set below its own threshold while remaining obvious across all of
+    # them together.
+    score_01 *= stuffing_multiplier(response, _TI_MARKERS + _GENERIC_CUES)
     return round(score_01 * 5.0, 2)      # map to 0–5 scale
 
 
@@ -221,11 +285,17 @@ def score_scenario(record: dict[str, Any],
     ft = record.get("fault_type", "none")
     domain = record.get("domain")
     is_nominal = record.get("is_nominal", ft == "none")
+    mult = stuffing_multiplier(resp, _GENERIC_CUES + _TI_MARKERS)
+    irs = compute_irs(resp, ft)
     return {
-        "frr": compute_frr(resp, required, domain, is_nominal),
-        "pei": compute_pei(resp, required, domain),
-        "irs": compute_irs(resp, ft),    # may be None for nominal
+        "frr": round(compute_frr(resp, required, domain, is_nominal) * mult, 4),
+        "pei": round(compute_pei(resp, required, domain) * mult, 4),
+        # None is preserved: an undefined metric is not scaled into existence.
+        "irs": (round(irs * mult, 4) if irs is not None else None),
         "ti":  compute_ti(resp),
+        # Declared on every record so nothing downstream can present a
+        # heuristic score as an LLM-judge one.
+        "scoring_method": SCORING_METHOD,
     }
 
 
