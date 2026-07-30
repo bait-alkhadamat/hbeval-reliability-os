@@ -101,7 +101,7 @@ logger = logging.getLogger("hb-eval-gateway")
 # intentionally kept in lockstep in this build). If you ever need the
 # protocol version to diverge from the SDK package version, split this
 # into PROTOCOL_VERSION and SOFTWARE_VERSION explicitly.
-PROTOCOL_VERSION = "2.4.0"
+PROTOCOL_VERSION = "2.6.0"
 
 
 # ── 2. Environment ──────────────────────────────────────────────────────────
@@ -289,17 +289,52 @@ async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, 
     api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
 
     if _supabase:
-        def _query():
+        # Look the key up by its SHA-256 digest, not by the key itself.
+        #
+        # api_key_hash was already being computed here, but only for log lines —
+        # the lookup used the raw value, which requires the plaintext key to sit
+        # in a queryable column. Matching on the digest is the standard practice
+        # (Stripe, GitHub) for one reason: a leaked database then yields nothing
+        # directly usable.
+        #
+        # Migration 15 adds and backfills api_key_hash. During rollout the
+        # plaintext path is retained as a fallback so a Gateway deployed before
+        # the migration lands does not reject every request. Once backfill is
+        # confirmed complete, the fallback below should be deleted — leaving it
+        # forever would preserve exactly the property this change removes.
+        _COLS = ("id, user_id, plan_type, evaluation_limit, evaluations_this_month, "
+                 "last_reset_date, evaluations_today, last_eval_date, "
+                 "aes_key_encrypted, hmac_secret_encrypted, is_active")
+
+        def _query_by_hash():
             return (
-                _supabase.table("agents")
-                .select("id, user_id, plan_type, evaluation_limit, evaluations_this_month, "
-                        "last_reset_date, evaluations_today, last_eval_date, "
-                        "aes_key_encrypted, hmac_secret_encrypted, "
-                        "is_active")
-                .eq("api_key", api_key)
-                .execute()
+                _supabase.table("agents").select(_COLS)
+                .eq("api_key_hash", api_key_hash).execute()
             )
-        result = await asyncio.to_thread(_query)
+
+        def _query_by_plaintext():
+            return (
+                _supabase.table("agents").select(_COLS)
+                .eq("api_key", api_key).execute()
+            )
+
+        try:
+            result = await asyncio.to_thread(_query_by_hash)
+        except Exception:
+            # The column does not exist yet (migration 15 not applied). Fall
+            # back rather than fail closed on every request during rollout.
+            logger.warning(
+                "api_key_hash lookup failed; falling back to plaintext match. "
+                "Apply migration 15 to remove this path."
+            )
+            result = await asyncio.to_thread(_query_by_plaintext)
+
+        if not result.data:
+            # Also try plaintext for rows the backfill has not reached.
+            try:
+                result = await asyncio.to_thread(_query_by_plaintext)
+            except Exception:
+                pass
         if not result.data:
             logger.warning("Rejected unknown API key (hash %s...).", api_key_hash[:8])
             raise HTTPException(status_code=401, detail="Invalid API key.")
@@ -378,22 +413,26 @@ async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, 
 ACCOUNT_LIMITS = {"free": 500, "pro": 5_000, "enterprise": 2_147_483_647}
 
 
-async def usage_gate(auth: dict = Depends(verify_api_key)) -> dict:
-    if not _supabase:
-        return auth
+async def _read_account_quota(user_id: str | None, plan: str,
+                              fallback: dict | None = None) -> dict:
+    """Read the account's shared usage counters and its limits.
+
+    Extracted so REST and MCP consult the SAME numbers by the same route. They
+    previously did not: the whole quota system lived on usage_gate, which the
+    MCP endpoint never touches, so a paid account could run verified
+    evaluations through MCP with no ceiling and no counter. A second door to a
+    metered capability that carries a different lock is a door with no lock.
+
+    Duplicating the logic instead of sharing it would recreate exactly the
+    drift hazard fixed elsewhere in this release.
+    """
     import math
     now = datetime.now(timezone.utc)
-    plan = auth.get("plan_type", "free")
-    user_id = auth.get("user_id")
-
-    # The authoritative monthly limit is the ACCOUNT limit for the plan.
     account_limit = ACCOUNT_LIMITS.get(plan, 500)
     month_used = 0
     today_used = 0
 
-    # Read the shared account counter from account_usage (migration 08). This is
-    # the single source of truth: one pool per account, shared by all its agents.
-    if user_id:
+    if _supabase and user_id:
         def _q():
             return (_supabase.rpc("get_account_quota", {"p_user_id": user_id})
                     .execute())
@@ -402,10 +441,9 @@ async def usage_gate(auth: dict = Depends(verify_api_key)) -> dict:
             rows = res.data or []
             if rows:
                 row = rows[0]
-                # Trust the plan-derived limit, but prefer the stored one if set.
                 account_limit = row.get("evaluation_limit") or account_limit
                 month_used = row.get("evaluations_this_month", 0) or 0
-            # Daily counter still read directly (separate column).
+
             def _qd():
                 return (_supabase.table("account_usage")
                         .select("evaluations_today, last_eval_date")
@@ -420,32 +458,58 @@ async def usage_gate(auth: dict = Depends(verify_api_key)) -> dict:
                     pass
         except Exception as exc:
             logger.error("Account quota read failed for %s: %s", user_id, exc)
-            # Fail closed on the monthly ceiling would block legitimate users on a
-            # transient DB error; instead fall back to the agent's own counter,
-            # which is conservative (never grants more than the account pool).
-            month_used = auth.get("evaluations_this_month", 0) or 0
-            today_used = auth.get("evaluations_today", 0) or 0
+            # A transient database error must not lock out legitimate users, so
+            # fall back to the per-agent counter, which can never exceed the
+            # account pool and is therefore the conservative choice.
+            if fallback:
+                month_used = fallback.get("evaluations_this_month", 0) or 0
+                today_used = fallback.get("evaluations_today", 0) or 0
 
-    # Monthly ceiling.
-    if month_used >= account_limit:
-        if plan == "free":
-            detail = (f"Monthly account limit reached ({account_limit}). "
-                      "Upgrade at https://hbeval.com/pricing for 5,000 evaluations/month.")
-        else:
-            detail = f"Monthly account limit of {account_limit} reached. Contact support."
-        raise HTTPException(status_code=429, detail=detail)
+    return {
+        "account_limit": account_limit,
+        "month_used": month_used,
+        "today_used": today_used,
+        # Monthly allowance spread across 28 days, so a single day cannot burn
+        # the month.
+        "daily_cap": max(1, math.ceil(account_limit / 28)),
+        "plan": plan,
+    }
 
-    # Daily ceiling (account-wide): allowance spread across 28 days.
-    daily_cap = max(1, math.ceil(account_limit / 28))
-    if today_used >= daily_cap:
-        raise HTTPException(
-            status_code=429,
-            detail=(f"Daily account limit reached ({daily_cap}/day). Your monthly "
-                    "allowance is spread across the month; please continue tomorrow."),
-        )
 
-    auth["account_month_used"] = month_used
-    auth["account_limit"] = account_limit
+def _quota_violation(q: dict, units: int = 1) -> str | None:
+    """Reason the request exceeds quota, or None when it is within limits."""
+    if q["month_used"] + max(0, units - 1) >= q["account_limit"]:
+        if q["plan"] == "free":
+            return (f"Monthly account limit reached ({q['account_limit']}). "
+                    "Upgrade at https://hbeval.com/pricing for 5,000 "
+                    "evaluations/month.")
+        return (f"Monthly account limit of {q['account_limit']} reached. "
+                "Contact support.")
+    if q["today_used"] + max(0, units - 1) >= q["daily_cap"]:
+        return (f"Daily account limit reached ({q['daily_cap']}/day). Your "
+                "monthly allowance is spread across the month; please continue "
+                "tomorrow.")
+    return None
+
+
+async def usage_gate(auth: dict = Depends(verify_api_key)) -> dict:
+    """Enforce the account's monthly and daily ceilings on a REST call.
+
+    Thin wrapper over the shared helpers so this path and the MCP path can
+    never diverge on what the limits are or how they are read.
+    """
+    if not _supabase:
+        return auth
+
+    quota = await _read_account_quota(
+        auth.get("user_id"), auth.get("plan_type", "free"), fallback=auth
+    )
+    violation = _quota_violation(quota, units=1)
+    if violation:
+        raise HTTPException(status_code=429, detail=violation)
+
+    auth["account_month_used"] = quota["month_used"]
+    auth["account_limit"] = quota["account_limit"]
     return auth
 
 
@@ -803,6 +867,36 @@ async def evaluate_battery(
 
         # Server-authoritative scoring — the client cannot tamper with this.
         report = aggregate_battery_results(scenario_results, required)
+
+        # Battery-spec drift check. The SDK mirrors this server's fault
+        # specification so the local and verified paths stress agents
+        # identically. If the two have diverged, the numbers are no longer
+        # comparable — and that must appear on the report rather than being
+        # left for someone to discover by contradiction later.
+        client_spec = payload.get("battery_spec")
+        try:
+            from fault_injection import battery_spec_fingerprint
+            server_spec = battery_spec_fingerprint()
+        except Exception:
+            server_spec = None
+
+        if client_spec and server_spec and client_spec != server_spec:
+            report["battery_spec_mismatch"] = {
+                "client": str(client_spec)[:32],
+                "server": server_spec,
+                "note": ("This SDK ran a different fault specification from "
+                         "the one this server scores against. Local and "
+                         "verified results are not directly comparable until "
+                         "the SDK is upgraded."),
+            }
+            logger.warning(
+                "Battery spec drift: client=%s server=%s (agent %s)",
+                client_spec, server_spec, agent_id,
+            )
+        elif client_spec is None:
+            # Older SDKs do not send it. Recorded, not warned: their absence is
+            # expected, not an anomaly.
+            report["battery_spec_mismatch"] = None
 
         gated = _apply_plan_gates(report, plan_type)
         asyncio.create_task(_store_evaluation(run_id, project_id, agent_id, payload, report))
@@ -1174,6 +1268,70 @@ def _coerce_metric(value: Any) -> float | None:
         return None
 
 
+async def _write_halt_audit(user_id: str | None, summary: dict) -> None:
+    """Record why a session halted, as a structured, queryable row.
+
+    Safe Halt stops an agent on the operator's behalf. Without this record the
+    operator sees only that something stopped — not which metric breached,
+    against which policy, at which step. In any deployment where halting
+    matters, that is the first question asked, and a system that cannot answer
+    it will simply have the feature switched off.
+
+    Written only when a halt actually occurred. Idempotent by the unique index
+    on session_id, so a retried summary cannot duplicate the entry.
+    """
+    if not _supabase or not summary.get("halted"):
+        return
+
+    record = summary.get("halt_record") or {}
+
+    def _to_iso(ts: Any) -> str | None:
+        try:
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError):
+            return None
+
+    def _num(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _int(v):
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    row = {
+        "session_id": str(summary.get("session_id", ""))[:200],
+        "user_id": user_id,
+        "agent_id": str(summary.get("agent_id", "unknown-agent"))[:200],
+        "metric": (str(record.get("metric"))[:32] if record.get("metric") else None),
+        "metric_value": _num(record.get("metric_value")),
+        "threshold": _num(record.get("threshold")),
+        "consecutive_steps": _int(record.get("consecutive_steps")),
+        "step_index": _int(record.get("step_index")),
+        # The policy verbatim: a halt must remain reproducible against the rule
+        # that produced it, even after the user changes their configuration.
+        "policy": record.get("policy") or summary.get("halt_policy") or {},
+        "reason": (str(record.get("reason") or summary.get("halt_reason") or "")[:500] or None),
+        "trigger_source": (str(record.get("trigger_source", "policy"))[:32]),
+        "occurred_at": _to_iso(record.get("occurred_at")) or datetime.now(timezone.utc).isoformat(),
+    }
+
+    def _write():
+        _supabase.table("halt_audit_log").upsert(row, on_conflict="session_id").execute()
+
+    try:
+        await asyncio.to_thread(_write)
+    except Exception as exc:
+        # An audit failure must not fail the session write that already
+        # succeeded; it is logged loudly instead, because a silently missing
+        # audit row is worse than a noisy one.
+        logger.error("Halt audit write failed (%s): %s", row["session_id"], exc)
+
+
 async def _store_monitoring_session(user_id: str | None, project_id: str,
                                     summary: dict) -> None:
     """Persist a monitoring session and its breach events."""
@@ -1213,6 +1371,13 @@ async def _store_monitoring_session(user_id: str | None, project_id: str,
             "halted": bool(summary.get("halted", False)),
             "halt_reason": (str(summary["halt_reason"])[:500]
                             if summary.get("halt_reason") else None),
+            # Cost of monitoring, measured on the client. NULL rather than 0
+            # when no steps were recorded: zero would report a measured cost
+            # of nothing, when in fact nothing was measured.
+            "overhead_p50_ms": _coerce_metric((summary.get("overhead") or {}).get("p50_ms")),
+            "overhead_p95_ms": _coerce_metric((summary.get("overhead") or {}).get("p95_ms")),
+            "overhead_p99_ms": _coerce_metric((summary.get("overhead") or {}).get("p99_ms")),
+            "overhead_samples": int((summary.get("overhead") or {}).get("samples", 0) or 0) or None,
             "pei_live": _coerce_metric(metrics.get("pei")),
             "frr_live": _coerce_metric(metrics.get("frr")),
             "irs_live": _coerce_metric(metrics.get("irs")),
@@ -1320,6 +1485,11 @@ async def monitoring_session(
             raise HTTPException(status_code=400, detail="A monitoring summary with 'session_id' is required.")
 
         await _store_monitoring_session(auth.get("user_id"), project_id, summary)
+
+        # Audit the halt decision, if there was one. Awaited rather than fired
+        # as a background task: an audit trail that races the response and may
+        # lose is not an audit trail.
+        await _write_halt_audit(auth.get("user_id"), summary)
 
         # Anonymous aggregate contribution, only if this account opted in.
         # Fired as a background task: the user's own session is already
@@ -2199,6 +2369,41 @@ async def oauth_revoke(
 MCP_PATH = "/mcp"
 
 
+# Inner rate limit for the expensive tool, on top of the endpoint-wide one.
+#
+# The endpoint limit (120/min) is applied by a FastAPI dependency, which runs
+# before the body is parsed and therefore cannot tell `initialize` — free — from
+# a verified evaluation that fires up to 60 outbound requests. At 120/min that
+# is 7,200 external HTTP calls per minute aimed at an address the caller
+# chooses, which makes this infrastructure a usable relay rather than a
+# monitoring service.
+#
+# Quota now bounds the total, but not the burst, so the burst is bounded here.
+MCP_EVAL_LIMIT_PER_MIN = 6
+
+
+async def _mcp_eval_rate_ok(user_id: str) -> bool:
+    """Whether this account may start another verified evaluation this minute.
+
+    Fails OPEN when Redis is unavailable, unlike the nonce guard which fails
+    closed. The distinction is deliberate: rejecting a replay protects against
+    an attack, whereas rejecting here would deny a paying user a legitimate
+    evaluation because of an infrastructure outage. Quota still bounds the
+    total in that window, so the exposure is a burst, not unlimited use.
+    """
+    if _redis is None:
+        return True
+    key = f"mcp_eval:{user_id}:{int(time.time() // 60)}"
+    try:
+        count = await _redis.incr(key)
+        if count == 1:
+            await _redis.expire(key, 120)
+        return count <= MCP_EVAL_LIMIT_PER_MIN
+    except Exception as exc:
+        logger.error("MCP eval rate check failed: %s", exc)
+        return True
+
+
 async def _mcp_auth(http_request: Request) -> dict:
     """Resolve the bearer token, or raise the 401 that begins OAuth discovery.
 
@@ -2232,9 +2437,14 @@ async def _agent_for_user(user_id: str) -> dict | None:
     silently getting the wrong one.
     """
     def _q():
+        # is_active is filtered here for the same reason verify_api_key checks
+        # it on the REST path: a deactivated agent must not be usable. Without
+        # this predicate, deactivation was enforced on one door and ignored on
+        # the other.
         return (_supabase.table("agents")
-                .select("id, name, agent_id, plan_type")
+                .select("id, name, agent_id, plan_type, is_active")
                 .eq("user_id", user_id)
+                .eq("is_active", True)
                 .order("created_at", desc=True).limit(1).execute())
     try:
         res = await asyncio.to_thread(_q)
@@ -2331,15 +2541,64 @@ async def mcp_endpoint(
         except ImportError:
             deps["run_verified_battery"] = None
 
+        # ── Quota, rate and metering for tools that actually spend money ──
+        #
+        # Everything below existed on the REST path via usage_gate and
+        # _increment_usage, and none of it was reachable from here. The same
+        # capability was metered through one door and free through the other.
+        units = mcp_tools.billable_units(tool_name, args)
+
+        if units > 0:
+            plan = (agent or {}).get("plan_type", "free")
+
+            if not await _mcp_eval_rate_ok(ctx["user_id"]):
+                return ok({
+                    "content": [{"type": "text", "text": json.dumps({
+                        "ok": False,
+                        "error": (f"Too many evaluations started in the last "
+                                  f"minute (limit {MCP_EVAL_LIMIT_PER_MIN}). "
+                                  f"Each one makes up to 60 outbound calls to "
+                                  f"your endpoint; please pace them."),
+                    }, indent=2)}],
+                    "isError": True,
+                })
+
+            quota = await _read_account_quota(ctx["user_id"], plan)
+            violation = _quota_violation(quota, units=units)
+            if violation:
+                return ok({
+                    "content": [{"type": "text", "text": json.dumps({
+                        "ok": False, "error": violation,
+                        "usage": {
+                            "used_this_month": quota["month_used"],
+                            "monthly_limit": quota["account_limit"],
+                            "used_today": quota["today_used"],
+                            "daily_limit": quota["daily_cap"],
+                        },
+                    }, indent=2)}],
+                    "isError": True,
+                })
+
         result = await mcp_tools.call_tool(
             tool_name, args,
             supabase=_supabase, to_thread=asyncio.to_thread,
             user_id=ctx["user_id"], agent=agent, deps=deps,
+            # Enforced inside call_tool. Passed explicitly rather than read
+            # from a global so the dependency is visible at the call site.
+            scopes=ctx.get("scopes") or [],
         )
         # isError is derived from the payload the tool itself returned, so a
         # refusal (wrong plan, missing consent) reads as a failed call to the
         # model rather than a successful one with an error inside it.
         is_error = '"ok": false' in result
+
+        # Meter only on success. Charging for a refused or failed call would
+        # bill a user for work that never happened; not charging for a
+        # successful one leaves a real cost invisible to every quota and
+        # billing system on the platform, which is what happened before.
+        if units > 0 and not is_error:
+            asyncio.create_task(_increment_usage(ctx["user_id"], units))
+
         return ok({"content": [{"type": "text", "text": result}],
                    "isError": is_error})
 
