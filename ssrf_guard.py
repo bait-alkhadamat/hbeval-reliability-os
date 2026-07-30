@@ -128,7 +128,20 @@ def validate_redirect_target(location: str, original_host: str) -> str:
     """Validate a redirect Location header before following it.
 
     Redirects are a classic SSRF bypass: a public URL 302-redirects to an
-    internal one. We re-validate the target with the same fail-closed policy.
+    internal one. This re-validates the target under the same fail-closed
+    policy.
+
+    CURRENTLY UNCALLED, AND THAT IS INTENTIONAL.
+    verified_runner sets follow_redirects=False and rejects any 3xx outright,
+    so there is no redirect to validate — refusing is strictly safer than
+    following a re-validated one, because re-validation reopens the same TOCTOU
+    window the refusal closes.
+
+    It is kept rather than deleted because a future caller that must follow
+    redirects (a user-configured webhook, say) needs exactly this check, and
+    rewriting it later invites getting it wrong. The note exists so nobody
+    reads the function's presence as evidence that redirects are being
+    validated somewhere — they are not; they are refused.
     """
     if not location:
         raise SSRFValidationError("Empty redirect target.")
