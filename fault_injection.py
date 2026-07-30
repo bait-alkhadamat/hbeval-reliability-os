@@ -86,6 +86,33 @@ MIN_SCENARIOS: int = 6           # at least one pass over the fault types
 NONE_FRACTION: float = 0.20      # 20% nominal trials, matching the source
 
 
+# ── Battery specification fingerprint (drift detection) ──────────────────────
+# The client SDK's battery module mirrors this one so the local path (B) and the
+# verified path (A) stress agents identically. That duplication is a real
+# maintenance hazard: add a seventh fault type here without updating the SDK and
+# the two paths quietly diverge while both are still presented as equivalent.
+#
+# Derived from the spec CONTENT rather than a hand-written version string,
+# because a version number is exactly what gets forgotten in the commit that
+# causes the drift. The SDK sends its own fingerprint with every battery
+# submission; a mismatch is recorded on the report rather than ignored.
+#
+# MUST stay byte-identical in behaviour to hb_eval_sdk/battery.py's copy.
+def battery_spec_fingerprint() -> str:
+    """Stable short digest of the battery specification."""
+    import hashlib
+    import json
+    spec = {
+        "fault_contexts": FAULT_CONTEXTS,
+        "fault_types": FAULT_TYPES,
+        "domains": DOMAINS,
+        "max_scenarios": MAX_SCENARIOS,
+        "min_scenarios": MIN_SCENARIOS,
+        "none_fraction": NONE_FRACTION,
+    }
+    canonical = json.dumps(spec, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
 def inject_fault(question: str, fault_type: str) -> str:
     """Append the fault context to a base task question.
 
