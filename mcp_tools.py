@@ -37,6 +37,50 @@ logger = logging.getLogger("hb-eval-gateway.mcp_tools")
 # Descriptions matter more than they look: this text is the ONLY thing a model
 # uses to decide whether a tool fits a request. Vague descriptions produce
 # tools that are never called, or called for the wrong thing.
+# ── Which OAuth scope each tool requires ─────────────────────────────────────
+# The scope system existed end-to-end on the issuing side — declared in
+# SUPPORTED_SCOPES, shown to the user on the consent screen, stored per token,
+# returned by resolve_bearer — and was never once consulted at the point of
+# execution. A token granted hbeval:read could run evaluate_agent_reliability,
+# which makes real outbound calls to the user's endpoint and spends paid quota.
+#
+# That is not a partial implementation of least privilege; it is a consent
+# screen making a promise the code does not keep. A scope that is displayed but
+# unenforced is worse than no scope at all, because the user believes they
+# restricted something.
+TOOL_SCOPES: dict[str, str] = {
+    "get_reliability_metrics":     "hbeval:read",
+    "list_my_agents":              "hbeval:read",
+    "get_reliability_trend":       "hbeval:read",
+    "retrieve_qualified_memory":   "hbeval:read",
+    "explain_verdict":             "hbeval:read",
+    # The only tool that acts rather than reads: it calls the agent's endpoint
+    # across up to 60 scenarios and consumes metered quota.
+    "evaluate_agent_reliability":  "hbeval:evaluate",
+}
+
+# Tools that consume evaluation quota, and how the unit count is derived.
+# Mirrors REST billing: a battery of N scenarios costs N units, not one.
+BILLABLE_TOOLS: frozenset[str] = frozenset({"evaluate_agent_reliability"})
+
+
+def required_scope(tool_name: str) -> str:
+    """Scope a tool needs. Unknown tools default to the stricter scope.
+
+    Defaulting to 'evaluate' rather than 'read' means a tool added later
+    without being registered here fails closed instead of inheriting read
+    access silently.
+    """
+    return TOOL_SCOPES.get(tool_name, "hbeval:evaluate")
+
+
+def billable_units(tool_name: str, args: dict) -> int:
+    """Quota units this call will consume."""
+    if tool_name not in BILLABLE_TOOLS:
+        return 0
+    return max(1, min(int(args.get("n_scenarios", 18) or 18), 60))
+
+
 TOOL_DEFINITIONS: list[dict] = [
     {
         "name": "get_reliability_metrics",
@@ -208,7 +252,7 @@ _METRICS_REFERENCE = {
 # ── Tool implementations ────────────────────────────────────────────────────
 async def call_tool(name: str, args: dict, *, supabase: Any, to_thread: Any,
                     user_id: str, agent: Optional[dict],
-                    deps: dict) -> str:
+                    deps: dict, scopes: Optional[list[str]] = None) -> str:
     """Dispatch one tool call.
 
     Args:
@@ -218,10 +262,24 @@ async def call_tool(name: str, args: dict, *, supabase: Any, to_thread: Any,
         user_id: resolved from the OAuth token — never from a parameter, so a
             caller cannot act as another account by passing an id.
         agent: the account's selected agent row, or None if it owns none.
+        scopes: granted by the OAuth token. Enforced below — a tool is refused
+            when its required scope was not granted. None means "not supplied",
+            which is treated as no scopes at all rather than as all of them:
+            a caller that forgets to pass them must fail closed.
         deps: Gateway internals this module must not import directly, to avoid
             a circular import: hci_edm, run_verified_battery,
             aggregate_battery_results, is_paid.
     """
+    # ── Scope enforcement, before anything else happens ──
+    granted = set(scopes or [])
+    needed = required_scope(name)
+    if needed not in granted:
+        return _err(
+            f"This connection was not granted the '{needed}' scope, which "
+            f"'{name}' requires. Reconnect and approve that permission to use "
+            f"it. Granted: {sorted(granted) or 'none'}."
+        )
+
     try:
         if name == "get_reliability_metrics":
             return _ok(_METRICS_REFERENCE)
@@ -433,7 +491,11 @@ async def _evaluate(agent: dict, args: dict, deps: dict) -> str:
     consent = bool(args.get("consent", False))
     agent_url = str(args.get("agent_url", ""))
     task = str(args.get("task_description", ""))
-    n = max(1, min(int(args.get("n_scenarios", 18) or 18), 60))
+    # Derived from the same function that computes the charge, not a second
+    # copy of the clamp. Two copies of this expression would let billing and
+    # execution drift apart silently — under- or over-charging for work that
+    # was actually done.
+    n = billable_units("evaluate_agent_reliability", args)
 
     if not consent:
         return _err(
