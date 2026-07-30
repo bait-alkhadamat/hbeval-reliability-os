@@ -7,8 +7,9 @@ fault-injection battery, so the user never touches the middle — no tampering
 is possible, and the result earns a `verified` mark.
 
 That power demands strict containment. Every outbound call here is:
-  * SSRF-validated (ssrf_guard) BEFORE the request, and pinned to the
-    validated public IP to defeat DNS rebinding;
+  * SSRF-validated (ssrf_guard) before the request, re-validated immediately
+    before each call, and the CONNECTED PEER ADDRESS checked against the
+    validated set afterwards — see the DNS rebinding note below;
   * bounded by a per-call timeout (a slow/hanging agent cannot tie up the
     platform);
   * bounded by a total battery ceiling (DoS / cost control);
@@ -30,7 +31,42 @@ from fault_injection import build_scenario_battery, inject_fault
 PER_CALL_TIMEOUT_S = 30          # one agent call may not exceed this
 MAX_RESPONSE_BYTES = 256 * 1024  # 256 KB cap per agent response
 MAX_VERIFIED_SCENARIOS = 100     # verified path may go up to 100 (full CSI)
-MAX_REDIRECTS = 0                # do NOT auto-follow redirects (SSRF safety)
+# Redirects are refused outright rather than followed and re-validated, so this
+# is asserted as follow_redirects=False on the client below AND checked again on
+# the response. Kept as a named constant because the value is a security
+# decision, not an implementation detail.
+MAX_REDIRECTS = 0
+
+# ── DNS rebinding: what is enforced, and what is not ─────────────────────────
+# The previous docstring claimed the connection was "pinned to the validated
+# public IP". It was not: the request used the hostname, so httpx re-resolved
+# DNS at connect time and ssrf_guard's public_ips were never consulted. That is
+# a TOCTOU window an attacker controlling their own DNS can drive.
+#
+# The obvious repair — putting the IP in the URL and passing sni_hostname — was
+# measured and REJECTED. In httpx 0.28 that silently stops enforcing
+# certificate hostname verification: a request to Google's IP claiming to
+# verify example.com completed successfully. Trading DNS rebinding for
+# accept-any-certificate is a worse position, not a better one.
+#
+# Patching socket.getaddrinfo was also measured and rejected: it has no effect
+# on httpx, which resolves through anyio.
+#
+# What is enforced instead:
+#   1. Re-validation immediately before every call, narrowing the window from
+#      the whole battery down to the gap between resolve and connect.
+#   2. The CONNECTED PEER ADDRESS is read after the handshake and checked
+#      against the validated public IPs. On mismatch the response is discarded
+#      and the scenario recorded as an error, which closes the exfiltration
+#      path — reading an internal endpoint is only useful if the body comes
+#      back.
+#   3. Full TLS verification is preserved, because the URL keeps the hostname.
+#
+# What is NOT enforced: the request may still reach a rebound address before
+# the peer check rejects its response. Fully preventing the connection needs a
+# resolver-level hook (aiohttp's resolver, or a custom httpx transport) and is
+# recorded as follow-up work rather than described here as though it were done.
+_PEER_CHECK_NOTE = "peer address verified against ssrf_guard public_ips"
 
 
 class VerifiedRunError(Exception):
@@ -87,7 +123,43 @@ async def run_verified_battery(
                        "scenario": scenario["domain"]}
             response_text, err = "", ""
             try:
-                resp = await client.post(validated["url"], json=payload)
+                # Re-validate before every call. If DNS has moved to a private
+                # or link-local address since the battery started, this raises
+                # and the scenario is recorded as an error rather than sent.
+                fresh = validate_agent_url(agent_url)
+                allowed_ips = set(fresh.get("public_ips") or []) | set(
+                    validated.get("public_ips") or [])
+
+                resp = await client.post(fresh["url"], json=payload)
+
+                # Where did we ACTUALLY connect? If the resolved address is not
+                # one we validated, the response is not trusted — discarded
+                # rather than returned, which is what closes the exfiltration
+                # path even though the request itself already went out.
+                peer_ip = None
+                stream = resp.extensions.get("network_stream")
+                if stream is not None:
+                    try:
+                        server_addr = stream.get_extra_info("server_addr")
+                        if server_addr:
+                            peer_ip = str(server_addr[0])
+                    except Exception:
+                        peer_ip = None
+
+                if peer_ip is not None and allowed_ips and peer_ip not in allowed_ips:
+                    err = (f"connection resolved to {peer_ip}, which was not in "
+                           f"the validated address set; response discarded "
+                           f"(possible DNS rebinding)")
+                    records.append({
+                        "scenario_index": idx,
+                        "domain": scenario["domain"],
+                        "fault_type": scenario["fault_type"],
+                        "is_nominal": scenario["fault_type"] == "none",
+                        "injected_question": injected_q,
+                        "response": "",
+                        "runner_error": err,
+                    })
+                    continue
 
                 # Reject redirects to anything (re-validation is strict; the
                 # safest stance for a security tool is not to follow them).
