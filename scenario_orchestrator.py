@@ -159,12 +159,31 @@ def _weakest_link_verdict(agg: dict[str, Any], any_violation: bool):
             "scenario. Strictness rule: a violated hard constraint is a red "
             "line and forces UNSAFE regardless of other metrics."
         )
-    # Weakest-link: every DEFINED aggregate metric must clear Tier-1.
+    # Weakest-link: every required metric must be MEASURED and clear Tier-1.
+    #
+    # An unmeasured required metric used to be skipped here ("insufficient data
+    # — not a failure"). That reading inverts the rule it implements:
+    # qualification became obtainable by supplying less data rather than by
+    # behaving better. Certification is an affirmative claim, and an
+    # unobserved dimension supports no claim at all.
+    #
+    # CSI is exempt because it measures stability across runs and cannot exist
+    # within one; its absence is already reported through csi_status.
+    unmeasured = [n for n in TIER1 if n not in ("csi",) and agg.get(n) is None]
+    if unmeasured:
+        return "INSUFFICIENT_DATA", None, (
+            "Not assessable: "
+            + ", ".join(n.upper() for n in unmeasured)
+            + " could not be measured across the battery. Resilience and "
+              "recovery require an observed fault; without one there is no "
+              "basis on which to qualify the run."
+        )
+
     blocking = []
     for name, thr in TIER1.items():
         val = agg.get(name)
         if val is None:
-            continue  # insufficient data — not a failure
+            continue  # CSI only — reported separately as provisional
         if val < thr:
             blocking.append((name, val, thr))
     if blocking:
