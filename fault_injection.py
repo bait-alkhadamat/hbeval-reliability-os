@@ -122,9 +122,25 @@ def inject_fault(question: str, fault_type: str) -> str:
     return question + FAULT_CONTEXTS.get(fault_type, "")
 
 
+def normalise_selection(fault_types=None, domains=None) -> tuple[list, list]:
+    """Validate a caller's fault-type and domain selection.
+
+    Unknown names are DROPPED rather than raising, and an empty result falls
+    back to the full set. A typo in a studio form must not produce an empty
+    battery that then reports a clean bill of health because nothing was
+    tested — silently measuring nothing is worse than an error message.
+    """
+    chosen_faults = [f for f in (fault_types or []) if f in FAULT_TYPES]
+    chosen_domains = [d for d in (domains or []) if d in DOMAINS]
+    return (chosen_faults or list(FAULT_TYPES),
+            chosen_domains or list(DOMAINS))
+
+
 def build_scenario_battery(
     n_scenarios: int = DEFAULT_SCENARIOS,
     seed: int | None = None,
+    fault_types: list | None = None,
+    domains: list | None = None,
 ) -> list[dict[str, str]]:
     """Build a stratified battery of (domain, fault_type) scenarios.
 
@@ -133,6 +149,15 @@ def build_scenario_battery(
         enough (n >= number of fault types), so the agent is genuinely
         stress-tested across the full fault taxonomy — not just a lucky
         subset. This is the essence of the platform: no gaming, full coverage.
+
+    NARROWING THE SELECTION
+    A caller may restrict fault_types or domains to target a weakness a team
+    already suspects. The coverage guarantee then applies to the SELECTED set
+    rather than all of them, which is a real reduction and is reported as such:
+    a result from a narrowed battery is not comparable to a full one, and a
+    consumer needs to be told that rather than left to infer it. Omitting both
+    keeps the full taxonomy, which stays the default because full coverage is
+    the point.
       * A NONE_FRACTION share of nominal (fault-free) trials provides the
         reliability-gap baseline.
       * Domains are cycled so coverage is broad.
@@ -143,6 +168,7 @@ def build_scenario_battery(
     # Clamp to safe bounds — never trust the caller's number blindly.
     n = max(MIN_SCENARIOS, min(int(n_scenarios), MAX_SCENARIOS))
     rng = random.Random(seed)
+    active_faults, active_domains = normalise_selection(fault_types, domains)
 
     # 1) Decide how many nominal trials (at least 1), rest are faults.
     n_none = max(1, round(n * NONE_FRACTION))
@@ -152,10 +178,10 @@ def build_scenario_battery(
     #    of every fault type, then fill the remainder by cycling.
     fault_seq: list[str] = []
     if n_fault > 0:
-        fault_seq.extend(FAULT_TYPES[:n_fault])              # at least one each
+        fault_seq.extend(active_faults[:n_fault])            # at least one each
         i = 0
         while len(fault_seq) < n_fault:                       # fill remainder
-            fault_seq.append(FAULT_TYPES[i % len(FAULT_TYPES)])
+            fault_seq.append(active_faults[i % len(active_faults)])
             i += 1
 
     # 3) Assemble the pool (faults + nominal) and shuffle.
@@ -166,7 +192,7 @@ def build_scenario_battery(
     battery: list[dict[str, str]] = []
     for i, ft in enumerate(pool):
         battery.append({
-            "domain": DOMAINS[i % len(DOMAINS)],
+            "domain": active_domains[i % len(active_domains)],
             "fault_type": ft,
             "is_nominal": ft == "none",
         })
