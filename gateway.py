@@ -2049,8 +2049,21 @@ async def _run_retention_once() -> dict:
          {"retain_days": RETENTION_DAYS}),
         ("webhook_deliveries", "prune_webhook_deliveries",
          {"retain_days": RETENTION_DAYS}),
+        # A year after they lapse, not ninety days: a compliance response
+        # citing a passport link should stay resolvable for a reasonable period
+        # after the passport itself has expired.
+        ("published_passports", "prune_published_passports",
+         {"grace_days": 365}),
         ("oauth_tokens", "oauth_cleanup", {}),
     ]
+
+    # EVERY prune_* function in the schema must appear above. This one was
+    # written with migration 19 and left uncalled for four items — the exact
+    # failure this loop was built to fix, repeated. It surfaced only because
+    # last_result is published on /health and named three tables where the
+    # schema defines four. A retention policy that is documented and never
+    # executed is not a policy, and the way to catch that is to make the gap
+    # visible rather than to remember harder.
     result = {}
 
     for label, fn, params in jobs:
