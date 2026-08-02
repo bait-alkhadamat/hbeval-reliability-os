@@ -77,6 +77,26 @@ from scenario_orchestrator import aggregate_battery_results
 # The module is also named hbeval_oauth rather than oauth to avoid colliding
 # with the `oauth` package on PyPI, which a transitive dependency could pull
 # in and shadow.
+# Alerting is optional in the same sense OAuth is: its absence disables
+# notifications and touches nothing else. A missing module must never stop the
+# Gateway from evaluating and monitoring, which is the core of the service.
+# Optional in the same sense as alerting: without it, passports are
+# unavailable and nothing else changes. Evaluation and monitoring are the core
+# of the service and must not depend on a reporting feature.
+try:
+    import passport as passport_lib
+    _HAS_PASSPORT = True
+except ImportError:
+    passport_lib = None
+    _HAS_PASSPORT = False
+
+try:
+    import alerts as alerts_lib
+    _HAS_ALERTS = True
+except ImportError:
+    alerts_lib = None
+    _HAS_ALERTS = False
+
 try:
     import hbeval_oauth as oauth_lib
     import mcp_tools
@@ -101,7 +121,7 @@ logger = logging.getLogger("hb-eval-gateway")
 # intentionally kept in lockstep in this build). If you ever need the
 # protocol version to diverge from the SDK package version, split this
 # into PROTOCOL_VERSION and SOFTWARE_VERSION explicitly.
-PROTOCOL_VERSION = "2.6.0"
+PROTOCOL_VERSION = "2.7.0"
 
 
 # ── 2. Environment ──────────────────────────────────────────────────────────
@@ -174,6 +194,9 @@ async def lifespan(_app: FastAPI):
     try:
         redis_conn = await aioredis.from_url(_REDIS_URL, decode_responses=True)
         await FastAPILimiter.init(redis_conn)
+
+        # Retention runs in-process; see the note above the loop.
+        asyncio.create_task(_retention_loop())
         _redis = redis_conn
         logger.info("Rate limiter + nonce guard initialised.")
     except Exception as exc:
@@ -225,6 +248,16 @@ if not _HAS_OAUTH:
 
 
 # ── 5. Models ────────────────────────────────────────────────────────────────
+class BatteryPreviewRequest(BaseModel):
+    """A studio selection. Every field is optional — the default is the full
+    taxonomy, because full coverage is what the battery is for."""
+    n_scenarios: int = Field(default=18, ge=6, le=60)
+    seed: int | None = Field(default=None)
+    fault_types: list | None = Field(default=None)
+    domains: list | None = Field(default=None)
+    question: str | None = Field(default=None, max_length=500)
+
+
 class EncryptedEvaluationRequest(BaseModel):
     ciphertext: str = Field(..., description="AES-256-GCM encrypted payload, hex-encoded.")
 
@@ -695,10 +728,102 @@ def _apply_plan_gates(result: dict, plan_type: str) -> dict:
 
 
 # ── 14. Endpoints ────────────────────────────────────────────────────────────
+# How long a dependency probe may take before it counts as unavailable. Short,
+# because a health check that hangs is itself an outage: whatever polls this is
+# waiting on it.
+HEALTH_PROBE_TIMEOUT_S = 3.0
+
+# Last successful retention sweep, exposed on /health. A retention policy is a
+# promise, and a promise nobody can verify is only a claim. This makes it
+# checkable.
+_last_retention_run: str | None = None
+_last_retention_result: dict | None = None
+
+
+async def _probe_supabase() -> tuple:
+    """Is the database actually reachable? Returns (state, detail)."""
+    if not _supabase:
+        return "not_configured", "Storage and auditing are disabled."
+
+    def _q():
+        # The cheapest query that proves a round trip completed.
+        return _supabase.table("agents").select("id").limit(1).execute()
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(_q),
+                               timeout=HEALTH_PROBE_TIMEOUT_S)
+        return "ok", None
+    except asyncio.TimeoutError:
+        return "degraded", f"No response within {HEALTH_PROBE_TIMEOUT_S}s."
+    except Exception as exc:
+        # The exception TYPE only. This endpoint is public, and a database
+        # error string can name schemas, hosts and columns.
+        return "down", type(exc).__name__
+
+
+async def _probe_redis() -> tuple:
+    """Redis backs replay protection and rate limiting.
+
+    Its absence is reported as degraded rather than down: evaluation still
+    works, but the nonce guard fails closed, so requests get rejected. That is
+    a real service impact, and reporting "ok" would hide it.
+    """
+    if _redis is None:
+        return "degraded", "Replay protection and rate limiting are unavailable."
+    try:
+        await asyncio.wait_for(_redis.ping(), timeout=HEALTH_PROBE_TIMEOUT_S)
+        return "ok", None
+    except asyncio.TimeoutError:
+        return "degraded", f"No response within {HEALTH_PROBE_TIMEOUT_S}s."
+    except Exception as exc:
+        return "degraded", type(exc).__name__
+
+
 @app.get("/health", tags=["Infrastructure"])
 async def health() -> dict:
-    return {"status": "ok", "version": PROTOCOL_VERSION,
-            "timestamp": datetime.now(timezone.utc).isoformat()}
+    """Service health, checked rather than asserted.
+
+    This previously returned {"status": "ok"} unconditionally, which meant it
+    reported healthy with the database down. A health check that cannot detect
+    ill health is worse than none: it turns an outage into a silent one, and
+    anything monitoring it learns nothing.
+
+    Public and unauthenticated, so it names no hostname, schema or error text —
+    only which component is affected, and how.
+    """
+    started = time.monotonic()
+    db_probe, redis_probe = await asyncio.gather(
+        _probe_supabase(), _probe_redis(),
+    )
+    db_state, db_detail = db_probe
+    redis_state, redis_detail = redis_probe
+
+    # The worst component decides. A service whose database is dead is not "ok"
+    # merely because the web process is still answering.
+    if db_state == "down":
+        overall = "down"
+    elif "degraded" in (db_state, redis_state) or db_state == "not_configured":
+        overall = "degraded"
+    else:
+        overall = "ok"
+
+    return {
+        "status": overall,
+        "version": PROTOCOL_VERSION,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "components": {
+            "database": {"status": db_state, "detail": db_detail},
+            "cache": {"status": redis_state, "detail": redis_detail},
+            "api": {"status": "ok", "detail": None},
+        },
+        # Published so the retention policy can be verified rather than taken
+        # on trust.
+        "retention": {
+            "last_run": _last_retention_run,
+            "last_result": _last_retention_result,
+        },
+        "probe_ms": int((time.monotonic() - started) * 1000),
+    }
 
 
 @app.post("/evaluate", tags=["Evaluation"])
@@ -1491,6 +1616,27 @@ async def monitoring_session(
         # lose is not an audit trail.
         await _write_halt_audit(auth.get("user_id"), summary)
 
+        # Alert on the halt itself. Always sent, never deduplicated against the
+        # breaches that led to it: a breach is a warning, a halt is an action
+        # already taken on the operator's behalf, and collapsing the two would
+        # hide the more important one.
+        if _HAS_ALERTS and summary.get("halted"):
+            record = summary.get("halt_record") or {}
+            asyncio.create_task(alerts_lib.dispatch(
+                _supabase, asyncio.to_thread, ssrf_guard,
+                user_id=auth.get("user_id"),
+                event={
+                    "event_type": "halt",
+                    "session_id": str(summary.get("session_id", "")),
+                    "agent_id": str(summary.get("agent_id", "unknown-agent")),
+                    "metric": record.get("metric"),
+                    "metric_value": record.get("metric_value"),
+                    "threshold": record.get("threshold"),
+                    "step_index": record.get("step_index"),
+                    "reason": summary.get("halt_reason"),
+                },
+            ))
+
         # Anonymous aggregate contribution, only if this account opted in.
         # Fired as a background task: the user's own session is already
         # stored, and a slow or failing contribution must not delay their
@@ -1584,6 +1730,47 @@ async def _apply_monitoring_batch(user_id: str | None, batch: dict) -> None:
         logger.error("Monitoring stream upsert failed (%s): %s", session_id, exc)
         return   # without the parent row the events have nothing to attach to
 
+    # ── Keep the snapshot instead of discarding it ──
+    #
+    # Every batch carries the full metric set, and until now each one
+    # overwrote the last on the session row. That left the platform able to
+    # report what an agent's metrics ARE and never what they DID — and
+    # reliability is a trajectory. An agent that ended at FRR 0.6 having fallen
+    # from 0.9 is a different problem from one that climbed there from 0.3.
+    #
+    # Upsert rather than insert: the unique (session_id, step_count) index in
+    # migration 16 means a batch reporting no new steps collides with what is
+    # already stored and changes nothing. Rows are bounded by steps taken, not
+    # by how long the agent ran, and a retried batch is idempotent.
+    snapshot = {
+        "session_id": session_id,
+        "user_id": user_id,
+        "agent_id": agent_id,
+        "step_count": row["step_count"],
+        # NULL preserved. A chart must show an undefined metric as a gap, never
+        # as a fall to zero.
+        "pei": row["pei_live"],
+        "frr": row["frr_live"],
+        "irs": row["irs_live"],
+        "ti": row["ti_live"],
+        "csi": row["csi_live"],
+        "breach_count": row["breach_count"],
+        "halted": row["halted"],
+        "recorded_at": now_iso,
+    }
+
+    def _upsert_snapshot():
+        _supabase.table("monitoring_snapshots").upsert(
+            snapshot, on_conflict="session_id,step_count"
+        ).execute()
+
+    try:
+        await asyncio.to_thread(_upsert_snapshot)
+    except Exception as exc:
+        # A lost snapshot costs one point on a chart. It must never cost the
+        # session write that already succeeded, so this is logged and dropped.
+        logger.debug("Snapshot write failed (%s): %s", session_id, exc)
+
     events = batch.get("events") or []
     if not isinstance(events, list) or not events:
         return
@@ -1606,6 +1793,26 @@ async def _apply_monitoring_batch(user_id: str | None, batch: dict) -> None:
 
     if not rows:
         return
+
+    # Alert on breaches. Fired as a background task and never awaited: a slow
+    # Slack endpoint must not add latency to a monitoring call an agent is
+    # waiting on. Deduplication happens in the database, so the same metric
+    # breaching on twenty consecutive steps produces one notification.
+    if _HAS_ALERTS and user_id:
+        for e in rows:
+            asyncio.create_task(alerts_lib.dispatch(
+                _supabase, asyncio.to_thread, ssrf_guard,
+                user_id=user_id,
+                event={
+                    "event_type": "breach",
+                    "session_id": session_id,
+                    "agent_id": agent_id,
+                    "metric": e.get("metric"),
+                    "metric_value": e.get("value"),
+                    "threshold": e.get("threshold"),
+                    "step_index": e.get("step_index"),
+                },
+            ))
 
     def _upsert_events():
         _supabase.table("monitoring_events").upsert(
@@ -1718,6 +1925,249 @@ async def _contribute_to_observatory(user_id: str | None, summary: dict) -> None
         # Never let a contribution failure affect the user's own session,
         # which has already been stored by this point.
         logger.error("Observatory contribution failed: %s", exc)
+
+
+# -- Fault Injection Studio -------------------------------------------------
+@app.post("/api/v1/battery/preview", tags=["Evaluation"])
+async def battery_preview(
+    request: BatteryPreviewRequest,
+    _rl=Depends(RateLimiter(times=30, seconds=60)),
+) -> dict:
+    """Show the battery a selection WOULD run, without running anything.
+
+    No agent is called, no quota is consumed, no result is stored.
+
+    This exists because "context_corruption" is a label until you see what it
+    actually does to a prompt. A team choosing which faults to gate their
+    pipeline on should be choosing from what the injection really says, not
+    from its name.
+
+    Unauthenticated on purpose: it returns the platform's own fault taxonomy,
+    which is published in the paper and the open-source repository, and nothing
+    about any account. Requiring a key to read public methodology would be
+    friction with no secret behind it. Rate limited because it is cheap for us
+    and cheap to abuse.
+    """
+    started = time.monotonic()
+    try:
+        from fault_injection import (
+            build_scenario_battery, inject_fault, normalise_selection,
+            FAULT_TYPES, DOMAINS,
+        )
+    except ImportError:
+        raise HTTPException(status_code=503,
+                            detail="Battery preview is unavailable.")
+
+    n = max(6, min(int(request.n_scenarios or 18), 60))
+    active_faults, active_domains = normalise_selection(
+        request.fault_types, request.domains)
+
+    # Reported so a caller sees their typo, rather than silently getting the
+    # full set back and believing they had narrowed the run.
+    unknown = (sorted(set(request.fault_types or []) - set(FAULT_TYPES))
+               + sorted(set(request.domains or []) - set(DOMAINS)))
+
+    battery = build_scenario_battery(
+        n, seed=request.seed,
+        fault_types=request.fault_types, domains=request.domains,
+    )
+
+    question = (request.question or "").strip()[:500] or (
+        "A shipment is three days late. Respond appropriately.")
+
+    scenarios = []
+    for i, s in enumerate(battery):
+        scenarios.append({
+            "index": i,
+            "domain": s["domain"],
+            "fault_type": s["fault_type"],
+            "is_nominal": s["is_nominal"],
+            # The actual text the agent would receive. This is the whole point
+            # of a preview: the injection itself, not a description of it.
+            "prompt": (question if s["is_nominal"]
+                       else inject_fault(question, s["fault_type"])),
+        })
+
+    counts: dict = {}
+    for s in battery:
+        counts[s["fault_type"]] = counts.get(s["fault_type"], 0) + 1
+
+    narrowed = (len(active_faults) < len(FAULT_TYPES)
+                or len(active_domains) < len(DOMAINS))
+
+    return {
+        "ok": True,
+        "n_scenarios": len(battery),
+        "seed": request.seed,
+        "scenarios": scenarios,
+        "counts": counts,
+        "available": {"fault_types": list(FAULT_TYPES), "domains": list(DOMAINS)},
+        "unknown_selections": unknown,
+        # Stated rather than left to be inferred. A narrowed battery no longer
+        # covers the full taxonomy, so its numbers are not comparable with a
+        # full run's, and whoever reads the result needs telling.
+        "narrowed": narrowed,
+        "coverage_note": (
+            f"This selection covers {len(active_faults)} of {len(FAULT_TYPES)} "
+            f"fault types and {len(active_domains)} of {len(DOMAINS)} domains. "
+            "Results from a narrowed battery are not comparable with a full run."
+            if narrowed else
+            "Full taxonomy: every fault type and domain is represented."
+        ),
+        "latency_ms": int((time.monotonic() - started) * 1000),
+    }
+
+
+# -- Retention ---------------------------------------------------------------
+# HOW OFTEN, AND WHY IT RUNS THIS WAY
+# Every 24 hours, plus once shortly after startup.
+#
+# The database functions to do this were written alongside the migrations that
+# created the tables, and nothing ever called them. A retention policy that is
+# documented but never executed is not a policy — it is a claim, and publishing
+# it would have made it a false one.
+#
+# An in-process task rather than an external scheduler, because this deployment
+# is a single instance: adding a cron service to run three SQL functions would
+# be more infrastructure than the job deserves. The trade is that a process
+# restarting constantly might never reach the 24-hour mark, which is exactly
+# why the last successful run is published on /health — so a gap is visible
+# rather than silent.
+RETENTION_INTERVAL_S = 24 * 60 * 60
+RETENTION_STARTUP_DELAY_S = 120       # let the service finish coming up first
+RETENTION_DAYS = 90
+
+
+async def _run_retention_once() -> dict:
+    """Call each cleanup function. Failures are recorded, never raised."""
+    global _last_retention_run, _last_retention_result
+    if not _supabase:
+        return {"skipped": "no database configured"}
+
+    jobs = [
+        ("monitoring_snapshots", "prune_monitoring_snapshots",
+         {"retain_days": RETENTION_DAYS}),
+        ("webhook_deliveries", "prune_webhook_deliveries",
+         {"retain_days": RETENTION_DAYS}),
+        ("oauth_tokens", "oauth_cleanup", {}),
+    ]
+    result = {}
+
+    for label, fn, params in jobs:
+        def _call(fn=fn, params=params):
+            return _supabase.rpc(fn, params).execute()
+        try:
+            res = await asyncio.to_thread(_call)
+            result[label] = (res.data
+                             if getattr(res, "data", None) is not None else "ok")
+        except Exception as exc:
+            # One failing function must not stop the others: a missing
+            # migration should not leave the other two tables growing forever.
+            result[label] = f"failed: {type(exc).__name__}"
+            logger.error("Retention job %s failed: %s", fn, exc)
+
+    _last_retention_run = datetime.now(timezone.utc).isoformat()
+    _last_retention_result = result
+    logger.info("Retention sweep complete: %s", result)
+    return result
+
+
+async def _retention_loop() -> None:
+    await asyncio.sleep(RETENTION_STARTUP_DELAY_S)
+    while True:
+        try:
+            await _run_retention_once()
+        except Exception:
+            logger.exception("Retention loop error")
+        await asyncio.sleep(RETENTION_INTERVAL_S)
+
+
+# -- Agent Passport ----------------------------------------------------------
+@app.get("/api/v1/passport/key", tags=["Passport"])
+async def passport_public_key(
+    _rl=Depends(RateLimiter(times=60, seconds=60)),
+) -> dict:
+    """The public key that verifies passports.
+
+    Unauthenticated, and that is the whole point. A passport is only worth
+    issuing if a third party — an auditor, a regulator, a customer — can check
+    it without asking us and without our permission. A public key behind a
+    login is not published.
+    """
+    if not _HAS_PASSPORT:
+        raise HTTPException(status_code=503, detail="Passports are unavailable.")
+    return passport_lib.public_key_info()
+
+
+@app.get("/api/v1/passport/{agent_id}", tags=["Passport"])
+async def get_passport(
+    agent_id: str,
+    days: int = 90,
+    auth: dict = Depends(verify_api_key),
+    _rl=Depends(RateLimiter(times=20, seconds=60, identifier=_api_key_identifier)),
+) -> dict:
+    """Issue a signed record of how this agent has behaved.
+
+    Free on every plan. A record of an agent's own behaviour is not a premium
+    feature — charging for the evidence would make the evidence look
+    negotiable.
+    """
+    if not _HAS_PASSPORT:
+        raise HTTPException(status_code=503, detail="Passports are unavailable.")
+
+    window = max(1, min(int(days or 90), 365))
+
+    fingerprint = None
+    try:
+        from fault_injection import battery_spec_fingerprint
+        fingerprint = battery_spec_fingerprint()
+    except Exception:
+        # Reported as null rather than omitted: the reader needs to know the
+        # run cannot be tied to a specification, not be left to notice that a
+        # field is absent.
+        pass
+
+    try:
+        return await passport_lib.build_passport(
+            _supabase, asyncio.to_thread,
+            agent_id=agent_id,
+            user_id=auth.get("user_id"),
+            window_days=window,
+            battery_fingerprint=fingerprint,
+            protocol_version=PROTOCOL_VERSION,
+        )
+    except PermissionError:
+        # Same response whether the agent belongs to someone else or does not
+        # exist. Distinguishing them confirms which agent ids are real.
+        raise HTTPException(status_code=404, detail="Agent not found.")
+    except Exception:
+        logger.exception("Passport generation failed for %s", agent_id)
+        raise HTTPException(status_code=500,
+                            detail="Could not generate the passport.")
+
+
+@app.post("/api/v1/passport/verify", tags=["Passport"])
+async def verify_passport_endpoint(
+    body: dict,
+    _rl=Depends(RateLimiter(times=60, seconds=60)),
+) -> dict:
+    """Check a passport against this deployment's key.
+
+    A convenience, never a requirement. Anyone can verify offline with the
+    published key, and a verifier that must be called would defeat the purpose:
+    this exists so a quick check does not require writing Ed25519 code, not so
+    that verification runs through us.
+    """
+    if not _HAS_PASSPORT:
+        raise HTTPException(status_code=503, detail="Passports are unavailable.")
+
+    info = passport_lib.public_key_info()
+    if not info.get("available"):
+        return {"valid": False, "reason": info.get("reason", "No key configured.")}
+
+    valid, reason = passport_lib.verify_passport(
+        body if isinstance(body, dict) else {}, info["public_key_b64"])
+    return {"valid": valid, "reason": reason, "key_id": info.get("key_id")}
 
 
 @app.get("/api/v1/observatory", tags=["Observatory"])
