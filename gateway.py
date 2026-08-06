@@ -53,7 +53,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -2157,6 +2157,152 @@ async def get_passport(
         logger.exception("Passport generation failed for %s", agent_id)
         raise HTTPException(status_code=500,
                             detail="Could not generate the passport.")
+
+
+@app.post("/api/v1/passport/demo", tags=["Passport"])
+async def demo_passport(
+    body: dict,
+    _rl=Depends(RateLimiter(times=20, seconds=60)),
+) -> dict:
+    """Sign a passport for the public demo run.
+
+    WHY THIS EXISTS SEPARATELY
+    The demo's whole argument is that measurement produces a document somebody
+    else can verify. Showing the metrics and then stopping short of the signed
+    artefact leaves the most important claim untested by the visitor.
+
+    But a demo passport must never be mistakable for a real one. Three things
+    keep them apart, and all three are inside the signed bytes so none can be
+    stripped without breaking the signature:
+
+      * demo: true, at the top level
+      * an agent id that says so
+      * a statement in the issuer block naming it a demonstration
+
+    WHY IT IS SIGNED WITH THE PRODUCTION KEY
+    Because a demo passport signed with a throwaway key would verify against
+    nothing, and the visitor would learn that verification "works" without
+    being able to check it. The signature is a true statement either way:
+    HB-Eval did issue this document, and it does say demo: true.
+
+    Unauthenticated and rate limited. It reads no account data and writes
+    nothing; the metrics arrive in the request because the demo computed them
+    with the published SDK.
+    """
+    if not _HAS_PASSPORT:
+        raise HTTPException(status_code=503, detail="Passports are unavailable.")
+
+    metrics_in = body.get("metrics") or {}
+    # Only the five known keys, only numbers or None. The payload comes from a
+    # public endpoint, and echoing arbitrary caller-supplied fields into a
+    # signed document would let anyone have us sign text of their choosing.
+    metrics = {}
+    for key in passport_lib.METRICS:
+        value = metrics_in.get(key)
+        metrics[key] = (float(value)
+                        if isinstance(value, (int, float))
+                        and not isinstance(value, bool) else None)
+
+    steps = max(0, min(int(body.get("steps") or 0), 10_000))
+    halted = bool(body.get("halted"))
+    halt_reason = str(body.get("halt_reason") or "")[:200] or None
+    breaches = max(0, min(int(body.get("breaches") or 0), 10_000))
+
+    now = datetime.now(timezone.utc)
+    issued_at = now.isoformat()
+    key_id = os.environ.get(passport_lib.ENV_KEY_ID, "default")
+    agent_id = "demo-support-agent"
+
+    fingerprint = None
+    try:
+        from fault_injection import battery_spec_fingerprint
+        fingerprint = battery_spec_fingerprint()
+    except Exception:
+        pass
+
+    passport = {
+        "schema_version": passport_lib.PASSPORT_SCHEMA_VERSION,
+        # Inside the signed bytes, so it cannot be removed without the
+        # signature failing.
+        "demo": True,
+        "passport_id": passport_lib.passport_id(agent_id, issued_at, key_id),
+        "issued_at": issued_at,
+        # Short-lived. A demo document circulating for ninety days would
+        # eventually be presented as evidence of something.
+        "expires_at": (now + timedelta(days=1)).isoformat(),
+        "validity_days": 1,
+        "window": {"days": 1, "since": issued_at},
+
+        "issuer": {
+            "name": "HB-Eval",
+            "url": "https://hbeval.com",
+            "protocol_version": PROTOCOL_VERSION,
+            "issued_by": "HB-Eval",
+            "statement": (
+                "DEMONSTRATION PASSPORT. This records a scripted demo run on "
+                "hbeval.com, not the behaviour of any deployed agent. The "
+                "signature is genuine and verifies against HB-Eval's published "
+                "key; what it attests is that HB-Eval issued this demo "
+                "document. It is not a certification, and it describes no real "
+                "system."
+            ),
+        },
+
+        "identity": {
+            "agent_id": agent_id,
+            "name": "Demo support agent (scripted)",
+            "created_at": issued_at,
+            "plan": "demo",
+            "active": False,
+        },
+
+        "reliability": {
+            "metrics": metrics,
+            "metric_names": passport_lib.METRIC_NAMES,
+            "undefined": [m for m in passport_lib.METRICS if metrics[m] is None],
+            "weakest": passport_lib._weakest(metrics),
+            "evidence": passport_lib.evidence_depth(1, steps),
+            "timeline": [],
+            "note": (
+                "A single scripted run. Averages across many sessions, and the "
+                "30/60/90-day trajectory, are what a real passport reports; one "
+                "run cannot supply either, so the timeline is empty rather than "
+                "filled with a repeated figure."
+            ),
+        },
+
+        "operational_record": {
+            "sessions": 1,
+            "steps_executed": steps,
+            "runtime_seconds": 0,
+            "runtime_hours": 0,
+            "sessions_halted": 1 if halted else 0,
+            "total_breaches": breaches,
+        },
+
+        "safety_record": {
+            "halt_decisions": 1 if halted else 0,
+            "halts": ([{"reason": halt_reason, "triggered_by": "policy",
+                        "at": issued_at}] if halted else []),
+            "alerts_raised": 0,
+            "alerts_delivered": 0,
+            "alerts_failed": 0,
+        },
+
+        "measurement": {
+            "fingerprint": passport_lib.measurement_fingerprint(
+                protocol_version=PROTOCOL_VERSION, battery_spec=fingerprint),
+            "battery_spec_fingerprint": fingerprint,
+            "monitoring_overhead_p50_ms": None,
+            "monitoring_overhead_p99_ms": None,
+            "note": (
+                "Metrics computed by hb-eval-sdk-js, the published package, "
+                "during a scripted demo run."
+            ),
+        },
+    }
+
+    return passport_lib.sign_passport(passport)
 
 
 @app.post("/api/v1/passport/verify", tags=["Passport"])
