@@ -358,6 +358,91 @@ def evidence_depth(sessions: int, steps: int) -> dict:
     }
 
 
+# Labels the passport reads out of session metadata. Only these, and only
+# strings: metadata is caller-supplied, and copying arbitrary keys into a
+# signed document would let anyone have us sign text of their choosing.
+PROVENANCE_KEYS = (
+    "model", "model_version", "prompt_version", "framework",
+    "framework_version", "sdk_version", "environment", "commit",
+)
+
+# What a reader is told when a label is absent, rather than leaving the field
+# out. An absent field looks like an oversight; "not recorded" is a fact about
+# the run, and it tells the reader what to ask the operator for.
+NOT_RECORDED = "not recorded"
+
+
+def _extract_provenance(sessions: list) -> dict:
+    """What produced these numbers — model, prompt, framework, commit.
+
+    WHY THIS IS A DEFECT FIX AND NOT A FEATURE
+
+    A passport records how an agent behaved. Until now it did not record WHAT
+    behaved. Swap the model and you have a different agent; edit the system
+    prompt and you may have a different agent. The old passport described
+    neither, so a document could outlive the thing it described and nobody
+    reading it could tell.
+
+    That makes a passport without provenance a record about nothing in
+    particular — the numbers are real, but they are not attached to anything a
+    reader can identify or reproduce.
+
+    CHANGES ARE REPORTED, NOT COLLAPSED
+
+    If sessions in the window ran under two different models, both are listed.
+    Showing only the most recent would hide the most important fact in the
+    document: that the figures average across a change, and the earlier half
+    describes a system that no longer exists.
+    """
+    seen: dict = {k: [] for k in PROVENANCE_KEYS}
+
+    for s in sessions:
+        meta = s.get("metadata")
+        if not isinstance(meta, dict):
+            continue
+        for key in PROVENANCE_KEYS:
+            value = meta.get(key)
+            if value is None:
+                continue
+            # Strings only, and bounded. This lands inside signed bytes.
+            text = str(value)[:120]
+            if text and text not in seen[key]:
+                seen[key].append(text)
+
+    out: dict = {}
+    changed = []
+    for key in PROVENANCE_KEYS:
+        values = seen[key][:5]
+        if not values:
+            out[key] = None
+        elif len(values) == 1:
+            out[key] = values[0]
+        else:
+            out[key] = values
+            changed.append(key)
+
+    out["changed_during_window"] = changed
+    out["note"] = (
+        "Read from session metadata supplied by the SDK caller. HB-Eval cannot "
+        "observe which model or prompt an agent used — it records what the "
+        "caller labelled. Fields showing null were never labelled, and a "
+        "passport with no provenance describes behaviour without identifying "
+        "what behaved."
+        if any(out[k] for k in PROVENANCE_KEYS) else
+        "No provenance was recorded. Pass model, prompt_version and framework "
+        "as session metadata so a passport identifies what produced these "
+        "numbers; without them the figures describe an unnamed system."
+    )
+    if changed:
+        out["warning"] = (
+            "These figures average across a change in "
+            + ", ".join(changed)
+            + ". Sessions before and after the change describe different "
+              "systems, and comparing them as one agent is a mistake."
+        )
+    return out
+
+
 def _bucket_timeline(sessions: list, now: datetime) -> list:
     """Metric averages over 30, 60 and 90 days.
 
@@ -493,7 +578,7 @@ async def build_passport(
             "monitoring_sessions",
             "session_id, started_at, duration_seconds, step_count, "
             "breach_count, halted, pei_live, frr_live, irs_live, ti_live, "
-            "csi_live, overhead_p50_ms, overhead_p99_ms",
+            "csi_live, overhead_p50_ms, overhead_p99_ms, metadata",
             [("agent_id", agent_id), ("user_id", user_id)],
             order=("created_at", True), limit=500))
         sessions = res.data or []
@@ -631,6 +716,11 @@ async def build_passport(
             "alerts_delivered": alerts_delivered,
             "alerts_failed": alerts_total - alerts_delivered,
         },
+
+        # What produced these numbers. A passport that records behaviour
+        # without recording what behaved is a record about nothing in
+        # particular.
+        "provenance": _extract_provenance(sessions),
 
         "measurement": {
             # Identifies HOW these figures were produced. Two passports with
