@@ -310,7 +310,8 @@ def passport_id(agent_id: str, issued_at: str, key_id: str) -> str:
 
 def measurement_fingerprint(*, protocol_version: str,
                             battery_spec: Optional[str],
-                            scoring_method: str = "heuristic_v2") -> str:
+                            scoring_method: str = "heuristic_v2",
+                            scoring_version: str = "v2") -> str:
     """Identifies HOW these figures were produced, not what they say.
 
     A fingerprint derived from metric VALUES would change on every session and
@@ -329,6 +330,13 @@ def measurement_fingerprint(*, protocol_version: str,
         "metrics": list(METRICS),
         "metric_scales": METRIC_MAX,
         "scoring_method": scoring_method,
+        # Included because the scoring DEFINITIONS changed, not just the code.
+        # In v2, IRS widened from deliberate recovery to deliberate handling —
+        # an agent that resists pressure or abstains now scores where it
+        # previously scored zero. Two passports sharing a battery fingerprint
+        # but differing in scoring version are still not comparable, and
+        # without this field they would look identical.
+        "scoring_version": scoring_version,
     }
     canonical = json.dumps(spec, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16].upper()
@@ -526,6 +534,7 @@ async def build_passport(
     window_days: int = DEFAULT_WINDOW_DAYS,
     battery_fingerprint: Optional[str] = None,
     protocol_version: str = "",
+    evidence_provenance: Optional[dict] = None,
 ) -> dict:
     """Assemble a passport from stored records.
 
@@ -731,6 +740,38 @@ async def build_passport(
                 protocol_version=protocol_version,
                 battery_spec=battery_fingerprint,
             ),
+            # METRIC VERSIONING
+            #
+            # A passport read two years from now must say which definition of
+            # each metric produced its figures. IRS changed meaning in v2 —
+            # from deliberate recovery to deliberate handling — so the same
+            # name denotes different quantities either side of that line, and a
+            # passport that recorded only the name would be unreadable later.
+            "metric_versions": {
+                "schema": "hb-metrics-2.0",
+                "irs": "2.0",   # widened: recovery -> deliberate handling
+                "pei": "1.0",
+                "frr": "1.0",
+                "ti": "1.0",
+                "csi": "1.0-provisional",
+            },
+            # PROVENANCE OF THE EVIDENCE
+            #
+            # Two identical scores are not equally trustworthy when one was
+            # reconciled against a behavioural trace and the other inferred
+            # from prose. Recorded so a reader can weigh them differently.
+            #
+            #   E0  response text only, no claim checked against conduct
+            #   E1  partial trace, some claims checkable
+            #   E2  complete trace, every claim testable
+            "evidence": evidence_provenance or {
+                "level": "E0",
+                "source": "response_text",
+                "claims_reconciled": False,
+                "note": "No behavioural evidence recorded for the sessions in "
+                        "this window. The figures rest on what the agent "
+                        "reported, not on what was observed of its conduct.",
+            },
             "battery_spec_fingerprint": battery_fingerprint,
             "monitoring_overhead_p50_ms": _avg(
                 [s.get("overhead_p50_ms") for s in sessions]),
