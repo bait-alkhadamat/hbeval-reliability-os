@@ -342,6 +342,90 @@ def measurement_fingerprint(*, protocol_version: str,
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16].upper()
 
 
+def session_evidence(sessions: list) -> dict:
+    """Evidence provenance for the sessions in this window.
+
+    WHY THIS EXISTS
+    A passport was reporting E0 — "scored from response text alone" — for an
+    agent whose sessions were fully instrumented. The battery path had learned
+    to record provenance; the monitoring path had not, so the passport defaulted
+    to the weakest class and understated its own evidence.
+
+    That is the safe direction to be wrong in, but it is still wrong: an
+    operator who instrumented their agent properly deserves a passport that
+    says so.
+
+    HOW THE LEVEL IS INFERRED
+    Monitoring does not store the raw per-step fields; it stores the metrics
+    computed from them. But a metric cannot be computed from a field that was
+    never supplied, so a non-null metric IS evidence that its input arrived:
+
+        frr_live present  ->  had_fault and success were recorded
+        irs_live present  ->  recovery judgements were recorded
+        ti_live present   ->  traceability was recorded
+        pei_live present  ->  re-planning was recorded
+
+    WHY runtime_observed AND NOT agent_reported
+    These fields were recorded step by step as execution proceeded, and the
+    session's own tallies constrain them — a caller cannot claim forty steps
+    while recording four. That is weaker than independent observation and
+    stronger than a trace assembled after the fact, which is exactly the middle
+    class the provenance scheme was built to hold.
+    """
+    if not sessions:
+        return {
+            "level": "E0",
+            "source": "none",
+            "claims_reconciled": False,
+            "note": "No sessions in this window.",
+        }
+
+    fields = ("pei_live", "frr_live", "irs_live", "ti_live")
+    per_session = []
+    for s in sessions:
+        present = sum(1 for k in fields if s.get(k) is not None)
+        per_session.append(present / len(fields))
+
+    # The weakest session governs, for the same reason a battery reports its
+    # weakest scenario: a window is only as well-evidenced as its thinnest run,
+    # and an average would let well-instrumented sessions mask bare ones.
+    weakest = min(per_session)
+    mean = round(sum(per_session) / len(per_session), 3)
+
+    if weakest >= 0.75:
+        level = "E2"
+    elif weakest > 0:
+        level = "E1"
+    else:
+        level = "E0"
+
+    note = {
+        "E2": "Every session in this window recorded the behavioural fields "
+              "the metrics are computed from, step by step during execution.",
+        "E1": "Some sessions recorded fewer behavioural fields than others. "
+              "The weakest governs, so parts of this window rest on less "
+              "evidence than the rest.",
+        "E0": "At least one session recorded no behavioural fields at all. "
+              "The figures for it rest on what was reported rather than on "
+              "what was observed of its conduct.",
+    }[level]
+
+    return {
+        "level": level,
+        "completeness": mean,
+        "source": "runtime_observed" if level != "E0" else "none",
+        "source_note": (
+            "Recorded step by step during execution and constrained by the "
+            "session's own tallies. Stronger than a trace assembled "
+            "afterwards, weaker than independent observation — HB-Eval did not "
+            "watch the agent run."
+        ),
+        "claims_reconciled": level != "E0",
+        "sessions_evaluated": len(sessions),
+        "note": note,
+    }
+
+
 def evidence_depth(sessions: int, steps: int) -> dict:
     """How much data stands behind the figures. Not a judgement of the agent.
 
@@ -764,7 +848,7 @@ async def build_passport(
             #   E0  response text only, no claim checked against conduct
             #   E1  partial trace, some claims checkable
             #   E2  complete trace, every claim testable
-            "evidence": evidence_provenance or {
+            "evidence": evidence_provenance or session_evidence(sessions) or {
                 "level": "E0",
                 "source": "response_text",
                 "claims_reconciled": False,
