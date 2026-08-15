@@ -445,6 +445,23 @@ async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, 
 # daily cap is likewise account-wide (allowance / 28).
 ACCOUNT_LIMITS = {"free": 500, "pro": 5_000, "enterprise": 2_147_483_647}
 
+# Free monthly runs of the VERIFIED path, per account.
+#
+# The verified path is the one capability the free plan cannot otherwise reach:
+# the platform calls the agent's endpoint itself, so the result cannot be
+# shaped by the agent. That is the difference between evidence an agent
+# reported about itself and evidence HB-Eval observed — the strongest thing the
+# paid tier offers, and the hardest to convey in a sentence.
+#
+# Five is enough to run it, read the passport, and compare it against a
+# self-reported one. It is also small enough that the outbound calls it spends
+# on somebody else's infrastructure stay bounded.
+#
+# Per ACCOUNT, not per agent: per agent would mean three agents buys fifteen.
+# Counted separately from the monthly allowance, because spending an ordinary
+# quota to discover a paid feature exists is the opposite of the intent.
+VERIFIED_TRIAL_LIMIT = 5
+
 
 async def _read_account_quota(user_id: str | None, plan: str,
                               fallback: dict | None = None) -> dict:
@@ -692,6 +709,55 @@ def _verify_signature(signing_secret: bytes, nonce_hex: str, timestamp: str,
     # Constant-time comparison prevents timing side-channels.
     if not hmac_module.compare_digest(expected, received_sig):
         raise HTTPException(status_code=403, detail="Invalid signature.")
+
+
+async def _claim_verified_trial(user_id: str | None) -> tuple:
+    """Claim one free verified run. Returns (granted, remaining).
+
+    Atomic in the database rather than read-then-write here: two requests
+    starting at once would otherwise both read four-used and both proceed,
+    which is not an exotic race — it is what a script does.
+    """
+    if not _supabase or not user_id:
+        return False, 0
+
+    def _q():
+        return _supabase.rpc("claim_verified_trial", {
+            "p_user_id": user_id,
+            "p_limit": VERIFIED_TRIAL_LIMIT,
+        }).execute()
+
+    try:
+        res = await asyncio.to_thread(_q)
+        rows = res.data or []
+        if not rows:
+            return False, 0
+        row = rows[0]
+        return bool(row.get("granted")), int(row.get("remaining") or 0)
+    except Exception:
+        # Fail CLOSED. A database problem must not silently hand out unlimited
+        # runs of the one metered capability the free plan is gated from.
+        return False, 0
+
+
+async def _refund_verified_trial(user_id: str | None) -> None:
+    """Give a claimed trial back when the run failed for our reasons.
+
+    Without this, a Gateway timeout or an internal error costs somebody an
+    allowance they never got any value from.
+    """
+    if not _supabase or not user_id:
+        return
+
+    def _q():
+        return _supabase.rpc("refund_verified_trial",
+                             {"p_user_id": user_id}).execute()
+    try:
+        await asyncio.to_thread(_q)
+    except Exception:
+        # Nothing to do. Losing a refund is a minor unfairness; raising here
+        # would replace the user's real error with a bookkeeping one.
+        pass
 
 
 # ── 13. Plan gating ──────────────────────────────────────────────────────────
@@ -1078,14 +1144,41 @@ async def evaluate_verified(
     billable_units = 1   # fair billing: verified battery costs N units (set below)
 
     try:
-        # ── Paid-plan gate: verified path is not available on the free plan ──
+        # ── Plan gate, with a monthly allowance on the free plan ─────────
+        #
+        # The verified path used to be closed to free accounts entirely. That
+        # made the most important difference between the plans invisible: on
+        # every other path the behavioural evidence comes from the agent's own
+        # runner, and here it comes from HB-Eval calling the agent itself.
+        #
+        # Somebody who has never seen both cannot evaluate the claim, and no
+        # amount of prose substitutes for running it and reading the two
+        # passports side by side. Five runs a month is enough to do that.
+        #
+        # The trial is claimed BEFORE the outbound call and refunded if the
+        # run fails for our reasons. Claiming afterwards would let a caller
+        # start many runs at once and have them all pass the check.
+        trial_claimed = False
+        trials_left = None
         if plan_type in (None, "free", "trial"):
-            status_code, error_code = 402, "UPGRADE_REQUIRED"
-            raise HTTPException(
-                status_code=402,
-                detail=("The verified evaluation path requires a paid plan. "
-                        "Use /evaluate_battery (local run) on the free plan."),
-            )
+            granted, remaining = await _claim_verified_trial(
+                auth.get("user_id"))
+            if not granted:
+                status_code, error_code = 402, "UPGRADE_REQUIRED"
+                raise HTTPException(
+                    status_code=402,
+                    detail=(
+                        f"You have used all {VERIFIED_TRIAL_LIMIT} free "
+                        "verified evaluations this month. The allowance "
+                        "resets at the start of next month, or a paid plan "
+                        "removes the limit. Meanwhile /evaluate_battery runs "
+                        "locally with no cap — the difference is that it "
+                        "scores evidence your agent reports about itself, "
+                        "while this path scores what HB-Eval observed."
+                    ),
+                )
+            trial_claimed = True
+            trials_left = remaining
 
         # ── Same security envelope as /evaluate (signature + nonce + decrypt) ──
         nonce = http_request.headers.get("X-HBEval-Nonce", "")
@@ -1162,7 +1255,25 @@ async def evaluate_verified(
         asyncio.create_task(edm_guard.consolidate(_supabase, run_id, project_id, payload, report))
 
         success, status_code, error_code = True, 200, None
-        return {**gated, "run_id": run_id}
+
+        # Reported in the response rather than left to be discovered by a 402
+        # on the sixth attempt. A limit somebody cannot see is a limit that
+        # arrives as a surprise, usually mid-script.
+        out = {**gated, "run_id": run_id}
+        if trials_left is not None:
+            out["verified_trial"] = {
+                "used_this_month": VERIFIED_TRIAL_LIMIT - trials_left,
+                "remaining_this_month": trials_left,
+                "limit": VERIFIED_TRIAL_LIMIT,
+                "note": (
+                    f"{trials_left} of {VERIFIED_TRIAL_LIMIT} free verified "
+                    "evaluations left this month. This path scores what "
+                    "HB-Eval observed by calling your agent; "
+                    "/evaluate_battery scores what your agent reported about "
+                    "itself, and has no cap."
+                ),
+            }
+        return out
 
     except HTTPException:
         raise
@@ -1171,6 +1282,19 @@ async def evaluate_verified(
         status_code, error_code = 500, "INTERNAL_SERVER_ERROR"
         raise HTTPException(status_code=500, detail="Internal server error.")
     finally:
+        # A claimed trial is returned unless the run actually completed.
+        #
+        # The failures here are timeouts, unreachable endpoints, and our own
+        # internal errors — none gave the user the thing the trial was for.
+        # Charging for them would let somebody exhaust a month's allowance
+        # without once seeing the feature work.
+        if trial_claimed and not success:
+            try:
+                await _refund_verified_trial(auth.get("user_id"))
+            except Exception:
+                # A lost refund is a minor unfairness; raising here would
+                # replace the user's real error with a bookkeeping one.
+                pass
         latency_ms = int((time.monotonic() - start_time) * 1000)
         ip_raw = http_request.client.host if http_request.client else None
         asyncio.create_task(_audit_log(
