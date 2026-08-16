@@ -462,6 +462,29 @@ ACCOUNT_LIMITS = {"free": 500, "pro": 5_000, "enterprise": 2_147_483_647}
 # quota to discover a paid feature exists is the opposite of the intent.
 VERIFIED_TRIAL_LIMIT = 5
 
+# The daily cap spreads a monthly allowance across the month so a single
+# afternoon cannot exhaust it. That is right for ordinary use and wrong for
+# testing the platform itself, where the whole point is to finish a run today.
+#
+# WHY AN ENVIRONMENT VARIABLE AND NOT A CODE CHANGE
+# Turning a limit off by editing a constant means turning it back on requires a
+# deploy — and a protection that is inconvenient to restore tends not to be
+# restored. This can be flipped from Railway in seconds, in both directions.
+#
+# DEFAULTS TO ON. A deployment that forgets to set it gets the safe behaviour,
+# which is the only sensible direction for a default to fail in.
+DAILY_CAP_ENABLED = os.environ.get(
+    "DAILY_CAP_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+
+if not DAILY_CAP_ENABLED:
+    # Logged at WARNING on every start, so a change made for an afternoon of
+    # testing cannot quietly become permanent. A rate limit nobody remembers
+    # disabling is how a month's allowance disappears in an hour.
+    logger.warning(
+        "DAILY_CAP_ENABLED=false - the per-day evaluation cap is OFF. An "
+        "account can spend its entire monthly allowance in a single day. "
+        "Set DAILY_CAP_ENABLED=true to restore it.")
+
 
 async def _read_account_quota(user_id: str | None, plan: str,
                               fallback: dict | None = None) -> dict:
@@ -535,7 +558,8 @@ def _quota_violation(q: dict, units: int = 1) -> str | None:
                     "evaluations/month.")
         return (f"Monthly account limit of {q['account_limit']} reached. "
                 "Contact support.")
-    if q["today_used"] + max(0, units - 1) >= q["daily_cap"]:
+    if DAILY_CAP_ENABLED and \
+            q["today_used"] + max(0, units - 1) >= q["daily_cap"]:
         return (f"Daily account limit reached ({q['daily_cap']}/day). Your "
                 "monthly allowance is spread across the month; please continue "
                 "tomorrow.")
