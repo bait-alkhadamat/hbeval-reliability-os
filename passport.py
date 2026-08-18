@@ -342,6 +342,22 @@ def measurement_fingerprint(*, protocol_version: str,
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16].upper()
 
 
+def _metric_versions() -> dict:
+    """Per-metric definition versions, read from the scorer that produced them.
+
+    Imported lazily so passport issuing keeps working if the scorer is
+    unavailable: a passport that cannot state its versions is worse than one
+    that can, and far better than one that fails to issue at all.
+    """
+    try:
+        from text_metrics import METRIC_VERSIONS
+        return dict(METRIC_VERSIONS)
+    except Exception:
+        return {"schema": "unknown",
+                "note": "Scoring module unavailable; metric versions could "
+                        "not be read. Treat comparisons with caution."}
+
+
 def session_evidence(sessions: list) -> dict:
     """Evidence provenance for the sessions in this window.
 
@@ -831,14 +847,11 @@ async def build_passport(
             # from deliberate recovery to deliberate handling — so the same
             # name denotes different quantities either side of that line, and a
             # passport that recorded only the name would be unreadable later.
-            "metric_versions": {
-                "schema": "hb-metrics-2.0",
-                "irs": "2.0",   # widened: recovery -> deliberate handling
-                "pei": "1.0",
-                "frr": "1.0",
-                "ti": "1.0",
-                "csi": "1.0-provisional",
-            },
+            # Read from the scorer rather than restated here. Two copies of a
+            # version table drift, and the copy in the passport is the one
+            # somebody will still be reading in two years - it must not be the
+            # stale one.
+            "metric_versions": _metric_versions(),
             # PROVENANCE OF THE EVIDENCE
             #
             # Two identical scores are not equally trustworthy when one was
