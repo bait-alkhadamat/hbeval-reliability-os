@@ -181,7 +181,55 @@ _GENERIC_CUES = [
 #       ("as per standard") that real answers almost never contain
 #   v2  IRS = deliberate HANDLING — recovery, resistance, or abstention;
 #       signal lists rewritten to the language agents actually produce
-SCORING_VERSION = "v2"
+SCORING_VERSION = "v3"
+
+# Per-metric versions, so a metric that did not change does not inherit a bump
+# it does not deserve. A reader comparing two results needs to know which
+# DEFINITIONS differ, not merely that the system moved on.
+#
+#   v3  PEI redefined: v1 was 1 - replans/steps, which penalised adapting and
+#       rewarded rigidity. An agent that thrashed through three blind retries
+#       and never changed course scored 1.00; one that recognised the fault and
+#       adapted once scored 0.79. v2 measures whether the amount of adaptation
+#       matched the amount of change that called for it.
+# ═══════════════════════════════════════════════════════════════════════
+#  FROZEN FOR EXTERNAL VALIDATION
+# ═══════════════════════════════════════════════════════════════════════
+#
+#  v3 is frozen for the duration of the external operator round. While the
+#  freeze holds, none of the following may change:
+#
+#    - metric definitions (PEI, IRS, FRR, TI, CSI)
+#    - weights and thresholds
+#    - how events are counted
+#    - the classification of any result after its output has been seen
+#
+#  WHY A FREEZE IS THE POINT AND NOT AN INCONVENIENCE
+#  Operators cannot be compared against each other if the instrument moves
+#  between them. Worse, adjusting a metric after seeing what it produced turns
+#  the validation round into a feedback loop that tunes the measure to the
+#  sample — which is the failure this project has already spent weeks undoing
+#  in the scorer.
+#
+#  A defect found during the round is recorded as a post-freeze issue and
+#  fixed afterwards. The single exception is a defect that makes a run invalid
+#  rather than merely wrong: a crash, corrupted output, or data not being
+#  recorded at all. Those produce no measurement to preserve.
+#
+#  After the round: results -> failure analysis -> metric review -> v4.
+#  In that order, and not before.
+FROZEN = True
+FREEZE_REASON = ("frozen for the external operator validation round; metric "
+                 "definitions may not change until it completes")
+
+METRIC_VERSIONS = {
+    "schema": "hb-metrics-2.0",
+    "irs": "2.0",   # widened in scoring v2: recovery -> deliberate handling
+    "pei": "2.0",   # redefined in scoring v3: stability -> proportionality
+    "frr": "1.0",
+    "ti": "1.0",
+    "csi": "1.0-provisional",
+}
 
 
 def _keyword_density_penalty(response: str, hits: int) -> float:
@@ -466,23 +514,94 @@ EVIDENCE_SOURCES = {
     "agent_reported": {
         "rank": 1,
         "label": "Agent-reported",
-        "note": "Supplied by the agent's own runner. Not independently "
-                "observed: an agent could report conduct it did not perform.",
+        "note": "The agent said something happened. Not independently "
+                "observed: an agent can report conduct it did not perform.",
+    },
+    "runtime_inferred": {
+        "rank": 2,
+        "label": "Runtime-inferred",
+        "note": "The system derived the fact from other events rather than "
+                "being told it. The derivation is deterministic and its rule "
+                "is published, but it remains an inference: repeating the "
+                "same call three times implies a retry, and does not prove "
+                "the agent intended one.",
     },
     "runtime_observed": {
-        "rank": 2,
-        "label": "Runtime-observed",
-        "note": "Recorded step by step during execution and constrained by the "
-                "session's own tallies. Stronger than a self-report, weaker "
-                "than independent observation.",
-    },
-    "externally_verified": {
         "rank": 3,
-        "label": "Externally verified",
-        "note": "Confirmed by a party other than the agent. Not available on "
-                "any path in this system today.",
+        "label": "Runtime-observed",
+        "note": "The runtime saw the event directly — a call was made, a "
+                "response arrived, a timeout elapsed. Nothing was reported "
+                "and nothing was inferred.",
+    },
+    "externally_observed": {
+        "rank": 4,
+        "label": "Externally observed",
+        "note": "Confirmed by a source outside both the agent and the local "
+                "SDK. Not available on any path in this system today.",
+    },
+    # Retained so results written against the earlier three-level scheme keep
+    # resolving. New code should use externally_observed.
+    "externally_verified": {
+        "rank": 4,
+        "label": "Externally observed",
+        "note": "Deprecated alias for externally_observed.",
+        "deprecated": True,
     },
 }
+
+# Strength is NOT derived from source, and the distinction matters.
+#
+# A deterministic inference can be stronger evidence than a claim: three
+# identical calls with identical arguments and identical responses is a firmer
+# basis for "retry" than an agent asserting it retried. Collapsing the two
+# axes would mean either understating good inference or overstating weak
+# observation.
+EVIDENCE_STRENGTH = ("low", "medium", "high")
+
+
+def field_evidence(value, source: str, strength: str = "medium") -> dict:
+    """Wrap a value with where it came from.
+
+    Provenance belongs on the FIELD, not the session. A single session
+    routinely mixes a runtime-observed timeout, a runtime-inferred re-plan and
+    an agent-reported intent — and labelling the whole session with one level
+    either flatters the weakest field or buries the strongest.
+
+    Carrying it per field lets a passport say more than "IRS = 0.91": it can
+    say that 78% of the evidence behind that number was runtime-observed, 17%
+    inferred, and 5% taken on the agent's word. That is the difference between
+    a score and a score somebody can weigh.
+    """
+    if source not in EVIDENCE_SOURCES:
+        raise ValueError(f"unknown evidence source: {source!r}")
+    if strength not in EVIDENCE_STRENGTH:
+        raise ValueError(f"unknown evidence strength: {strength!r}")
+    return {"value": value, "source": source, "strength": strength}
+
+
+def evidence_mix(fields: dict) -> dict:
+    """Distribution of provenance across a set of wrapped fields."""
+    counts, total = {}, 0
+    for spec in fields.values():
+        if not isinstance(spec, dict) or "source" not in spec:
+            continue
+        src = spec["source"]
+        if src == "externally_verified":
+            src = "externally_observed"
+        counts[src] = counts.get(src, 0) + 1
+        total += 1
+    if not total:
+        return {"total_fields": 0, "distribution": {}, "weakest": None}
+
+    order = {k: v["rank"] for k, v in EVIDENCE_SOURCES.items()}
+    return {
+        "total_fields": total,
+        "distribution": {k: round(v / total, 3) for k, v in sorted(counts.items())},
+        # The weakest source present, for the same reason a battery reports its
+        # weakest scenario: a figure is only as well-sourced as its thinnest
+        # input, and an average would let observed fields mask reported ones.
+        "weakest": min(counts, key=lambda s: order.get(s, 0)),
+    }
 
 
 # Evidence levels. Two scores of 0.87 are not equally trustworthy when one was
