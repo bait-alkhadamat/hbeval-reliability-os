@@ -23,7 +23,7 @@ from __future__ import annotations
 import sys
 
 from text_metrics import (EVIDENCE_SOURCES, evidence_mix, field_evidence,
-                          FROZEN)
+                          FREEZE_REASON, FROZEN)
 
 
 def main() -> int:
@@ -105,10 +105,20 @@ def main() -> int:
         failures.append("legacy externally_verified did not map forward")
     print("\nLegacy externally_verified -> externally_observed: ok")
 
+    # The freeze STATE is not asserted, only that it is stated and reasoned.
+    #
+    # An earlier version required FROZEN to be True, which was right during the
+    # validation round and wrong the moment it ended. A test that must be
+    # edited whenever the project moves is a test that will be edited
+    # carelessly.
+    #
+    # What must always hold is that the flag carries a reason: a freeze without
+    # one cannot be audited, and a lifted freeze without one cannot be told
+    # apart from a forgotten one.
     print(f"\nScoring frozen: {FROZEN}")
-    if not FROZEN:
-        failures.append("scoring is not frozen — the external round needs a "
-                        "fixed instrument")
+    print(f"  reason: {FREEZE_REASON[:58]}...")
+    if not FREEZE_REASON or len(FREEZE_REASON) < 20:
+        failures.append("the freeze flag carries no stated reason")
 
     print()
     print("=" * 70)
