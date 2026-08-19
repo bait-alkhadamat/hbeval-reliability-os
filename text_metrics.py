@@ -193,7 +193,40 @@ SCORING_VERSION = "v3"
 #       adapted once scored 0.79. v2 measures whether the amount of adaptation
 #       matched the amount of change that called for it.
 # ═══════════════════════════════════════════════════════════════════════
-#  FROZEN FOR EXTERNAL VALIDATION
+#  EXTERNAL VALIDATION ROUND — COMPLETE
+# ═══════════════════════════════════════════════════════════════════════
+#
+#  The freeze below has been lifted because the round finished, not because it
+#  became inconvenient. That distinction is the whole value of declaring one.
+#
+#  WHAT THE ROUND ESTABLISHED
+#  Three independent operators, on their own machines and accounts, ran the
+#  frozen battery against two agent variants. Six signed passports returned:
+#
+#    robust   PEI 1.000  IRS 1.000  FRR 0.500  TI 5.000  halted 0/6
+#    fragile  PEI 0.778  IRS 0.000  FRR 0.000  TI 1.945  halted 4/6
+#
+#  Identical to three decimal places across all three operators, under one
+#  measurement fingerprint (FF5D5EB6FAC37F48) and one battery specification
+#  (ce481b32763df1ca).
+#
+#  WHAT IT DID NOT ESTABLISH
+#  Both agents were written by this project. Reproducibility across operators
+#  shows the instrument is stable; it does not show the instrument measures
+#  reliability. Two operators reached that conclusion independently: what would
+#  convince them is evidence the metrics predict failures that later appear in
+#  production, not that they separate two agents built in advance to differ.
+#
+#  That remains open, and no amount of internal work closes it.
+#
+#  WHAT THE ROUND FOUND
+#  Seven findings, none concerning a metric. All seven were presentation and
+#  explanation: operators could not tell how per-round figures became passport
+#  figures, the evidence level appeared without explaining itself, and the dash
+#  meaning "not measured" went unnoticed by all three.
+#
+#  The measurement worked. Nobody could tell what it was saying. That is worth
+#  more than a metric change would have been.
 # ═══════════════════════════════════════════════════════════════════════
 #
 #  v3 is frozen for the duration of the external operator round. While the
@@ -218,9 +251,9 @@ SCORING_VERSION = "v3"
 #
 #  After the round: results -> failure analysis -> metric review -> v4.
 #  In that order, and not before.
-FROZEN = True
-FREEZE_REASON = ("frozen for the external operator validation round; metric "
-                 "definitions may not change until it completes")
+FROZEN = False
+FREEZE_REASON = ("external validation round complete; see the record above. "
+                 "Freeze again before any future comparative round.")
 
 METRIC_VERSIONS = {
     "schema": "hb-metrics-2.0",
