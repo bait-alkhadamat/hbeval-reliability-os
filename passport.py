@@ -283,11 +283,39 @@ def verify_passport(passport: dict, public_key_b64: str):
         key = Ed25519PublicKey.from_public_bytes(
             base64.b64decode(public_key_b64))
         key.verify(base64.b64decode(sig["value"]), canonical_bytes(passport))
-        return True, "Signature is valid."
     except Exception:
         # No detail: distinguishing "wrong key" from "altered document" tells
         # someone probing which of the two to change.
         return False, "Signature does not match this document."
+
+    # EXPIRY IS CHECKED, NOT MERELY RECORDED.
+    #
+    # expires_at sits inside the signed bytes, so it cannot be edited without
+    # breaking the signature. But a verifier that checks only the signature
+    # will accept a document that expired months ago. Demo passports expire in
+    # 24 hours precisely so they cannot later be presented as production
+    # credentials, and that guarantee is worth nothing unenforced.
+    #
+    # Reported separately from a signature failure: an expired passport is
+    # authentic and stale, which is a different problem from a forged one and
+    # deserves a different answer.
+    expires = passport.get("expires_at")
+    if expires:
+        try:
+            from datetime import datetime, timezone
+            exp = datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if exp < datetime.now(timezone.utc):
+                return False, (
+                    f"Signature is valid, but this passport expired on "
+                    f"{exp.date().isoformat()}. It is authentic and no longer "
+                    f"current."
+                )
+        except (ValueError, TypeError):
+            return False, "Signature is valid, but expires_at is unreadable."
+
+    return True, "Signature is valid."
 
 
 # -- Identity and comparability ----------------------------------------------
@@ -340,6 +368,20 @@ def measurement_fingerprint(*, protocol_version: str,
     }
     canonical = json.dumps(spec, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16].upper()
+
+
+def _scoring_version() -> str:
+    """The scorer's own version, for the measurement fingerprint.
+
+    Read from text_metrics rather than hard-coded, for the same reason the
+    metric version table is: two copies of a version drift, and the copy inside
+    a signed document is the one somebody will still be reading in two years.
+    """
+    try:
+        from text_metrics import SCORING_VERSION
+        return SCORING_VERSION
+    except Exception:
+        return "unknown"
 
 
 def _metric_versions() -> dict:
@@ -836,9 +878,17 @@ async def build_passport(
             # the same fingerprint were measured the same way and can be
             # compared; two with different fingerprints cannot, however similar
             # the numbers look.
+            # Scoring version read from the scorer, not left to the default.
+            #
+            # It was omitted here, so the default of "v2" was used while the
+            # scorer had moved to v3 - meaning passports produced under PEI v1
+            # and PEI v2 carried the SAME fingerprint. The one field whose
+            # entire purpose is to say "these two results are not comparable"
+            # was saying the opposite.
             "fingerprint": measurement_fingerprint(
                 protocol_version=protocol_version,
                 battery_spec=battery_fingerprint,
+                scoring_version=_scoring_version(),
             ),
             # METRIC VERSIONING
             #
