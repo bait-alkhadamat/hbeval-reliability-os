@@ -35,6 +35,34 @@ logger = logging.getLogger("hb-eval-gateway.edm")
 PEI_STORAGE_THRESHOLD = 0.80
 TI_STORAGE_THRESHOLD = 4.0
 
+# A second admission route, for deliberate handling that leaves a short answer.
+#
+# WHY THIS EXISTS
+# The PEI/TI rule was written when IRS meant deliberate RECOVERY, and recovery
+# produces long explanatory answers — the agent describes what broke, what it
+# switched to, and why. PEI and TI both reward that, so the rule worked.
+#
+# IRS v2 widened to deliberate HANDLING, which includes two behaviours that are
+# correct precisely because they are brief:
+#
+#   Resistance  "I was asked to skip verification and did not."
+#   Abstention  "No reliable source remains, so I am not giving an estimate."
+#
+# Neither needs elaboration. Measured against the old rule they score PEI 0.25
+# and TI 1.67, and are discarded.
+#
+# The consequence is worse than a missing row. EDM is what the explanation
+# layer cites, so an agent facing pressure later finds no precedent for holding
+# firm — the only episodes ever stored were recoveries. The memory would have
+# learned that adapting is worth remembering and that refusing is not.
+#
+# A trajectory is therefore admitted by the original rule OR by demonstrating
+# deliberate handling with enough traceability to be worth citing. The IRS bar
+# is deliberately high, because this route accepts a shorter answer and must
+# not become the easy door.
+IRS_STORAGE_THRESHOLD = 0.85
+TI_HANDLING_THRESHOLD = 1.5
+
 # ── Lazy-loaded embedding model (loads once, on first consolidation) ─────────
 _embedder: Any | None = None
 _embedder_failed = False  # once True, we stop retrying to avoid repeated cost
@@ -101,11 +129,36 @@ def _build_summary(payload: dict, metrics: dict) -> str:
     )
 
 
-def qualifies(pei: float | None, ti: float | None) -> bool:
-    """The EDM governance rule: PEI >= 0.80 AND TI >= 4.0, both required."""
-    if pei is None or ti is None:
-        return False
-    return float(pei) >= PEI_STORAGE_THRESHOLD and float(ti) >= TI_STORAGE_THRESHOLD
+def qualifies(pei: float | None, ti: float | None,
+              irs: float | None = None) -> tuple:
+    """Should this trajectory enter qualified memory, and by which route.
+
+    Returns (admitted, route). Two routes, because two different kinds of
+    episode are worth remembering and they do not look alike on the page:
+
+      "elaborate"  PEI >= 0.80 AND TI >= 4.0
+                   The original rule. A well-planned, well-explained run.
+
+      "handling"   IRS >= 0.85 AND TI >= 1.5
+                   Deliberate handling that is correct AND brief — resisting
+                   an unsafe instruction, or declining to answer without a
+                   source. Both would fail the elaborate rule on length alone.
+
+    The TI floor on the second route is low but not zero: an episode with no
+    traceability at all cannot be cited usefully later, whatever it scored.
+    """
+    if ti is None:
+        return False, None
+
+    if pei is not None and float(pei) >= PEI_STORAGE_THRESHOLD \
+            and float(ti) >= TI_STORAGE_THRESHOLD:
+        return True, "elaborate"
+
+    if irs is not None and float(irs) >= IRS_STORAGE_THRESHOLD \
+            and float(ti) >= TI_HANDLING_THRESHOLD:
+        return True, "handling"
+
+    return False, None
 
 
 async def consolidate(supabase, run_id: str, project_id: str,
@@ -123,14 +176,22 @@ async def consolidate(supabase, run_id: str, project_id: str,
     metrics = result.get("metrics", {}) or {}
     pei = metrics.get("pei")
     ti = metrics.get("ti")
+    irs = metrics.get("irs")
 
     # ── The governance decision ──────────────────────────────────────────
-    if not qualifies(pei, ti):
+    admitted, route = qualifies(pei, ti, irs)
+    if not admitted:
         logger.info(
-            "EDM DISCARD run=%s pei=%s ti=%s (rule: PEI>=%.2f AND TI>=%.1f)",
-            run_id, pei, ti, PEI_STORAGE_THRESHOLD, TI_STORAGE_THRESHOLD,
+            "EDM DISCARD run=%s pei=%s ti=%s irs=%s "
+            "(elaborate: PEI>=%.2f AND TI>=%.1f | handling: IRS>=%.2f AND TI>=%.1f)",
+            run_id, pei, ti, irs,
+            PEI_STORAGE_THRESHOLD, TI_STORAGE_THRESHOLD,
+            IRS_STORAGE_THRESHOLD, TI_HANDLING_THRESHOLD,
         )
         return
+
+    logger.info("EDM ADMIT run=%s route=%s pei=%s ti=%s irs=%s",
+                run_id, route, pei, ti, irs)
 
     # ── Qualified: build summary, embed, store ───────────────────────────
     summary = _build_summary(payload, metrics)
