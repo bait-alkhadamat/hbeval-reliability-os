@@ -82,12 +82,38 @@ def _fmt(v: Any) -> str:
 
 # ── The four explanation templates (HCI-EDM) ────────────────────────────────
 def _template_success(mem: dict, sim: float) -> str:
+    """Cite a qualified prior episode, naming the route it qualified by.
+
+    Memory admits trajectories two ways since IRS v2 — an elaborate,
+    well-planned run, or deliberate handling that is correct and brief
+    (resisting an unsafe instruction, declining without a source).
+
+    Saying "clearing the reliability thresholds" for both would misdescribe the
+    second: it did not clear the PEI and TI bars, it cleared a different one.
+    An explanation that misstates why its own citation qualified is worse than
+    no explanation, because it sounds authoritative.
+    """
+    pei = mem.get("pei_score")
+    ti = mem.get("ti_score")
+    irs = mem.get("irs_score")
+
+    elaborate = (pei is not None and float(pei) >= 0.80
+                 and ti is not None and float(ti) >= 4.0)
+
+    if elaborate:
+        basis = (f"That episode achieved PEI={_fmt(pei)} and TI={_fmt(ti)}, "
+                 f"clearing the planning and traceability thresholds.")
+    else:
+        basis = (f"That episode qualified on deliberate handling — "
+                 f"IRS={_fmt(irs)} with TI={_fmt(ti)} — rather than on "
+                 f"elaboration. Handling a fault correctly does not always "
+                 f"produce a long answer: refusing an unsafe instruction, or "
+                 f"declining to answer without a source, is brief by nature.")
+
     return (
-        f"This decision aligns with a certified prior episode "
-        f"(ref {mem['id']}, similarity {sim:.2f}). That episode achieved "
-        f"PEI={_fmt(mem.get('pei_score'))} and TI={_fmt(mem.get('ti_score'))}, "
-        f"clearing the reliability thresholds. The plan structure matches a "
-        f"pattern with a documented high-quality outcome."
+        f"This decision aligns with a qualified prior episode "
+        f"(ref {mem['id']}, similarity {sim:.2f}). {basis} The plan structure "
+        f"matches a pattern with a documented outcome."
     )
 
 
