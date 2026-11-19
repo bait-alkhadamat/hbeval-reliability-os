@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Build:  docker build -t hb-eval-gateway .                       (with production embeddings)
 #         docker build --build-arg WITH_EMBEDDINGS=0 -t hb-eval-gateway .   (lightweight smoke test)
-FROM python:3.12-slim-bookworm AS build
+FROM python:3.15-slim-bookworm AS build
 ARG WITH_EMBEDDINGS=1
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /build
@@ -23,7 +23,7 @@ RUN sha256sum -c SHA256SUMS && pip install --no-deps ./*.whl && pip check \
       && python -c "from sentence_transformers import SentenceTransformer"; \
     fi
 
-FROM python:3.12-slim-bookworm
+FROM python:3.15-slim-bookworm
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PATH="/opt/venv/bin:$PATH"
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin gateway
 COPY --from=build /opt/venv /opt/venv
