@@ -23,3 +23,9 @@ Use existing repositories, small reviewed changes, tests and preview before prod
 - SDK PR https://github.com/hb-evalSystem/sdk/pull/1 merged: six fixture tests for declared action scope. These fixtures do not establish real-world fitness.
 - Gateway main snapshot 877f10a: 23 tracked files. Relative to the archive manifest 18 match, five differ and 27 archive entries are absent. Production SHA and Railway service binding remain open.
 - Vercel platform production previously mapped to 7af8230. Supabase schema was readable; binding to production still needs independent confirmation.
+
+## Days 1–5 progress — Gateway staging baseline
+
+- Gateway 2.13.0 merged in [PR #2](https://github.com/bait-alkhadamat/hbeval-reliability-os/pull/2) at `72d621efebbc15f43be45979ddf2a61c9d79331e`. The tested PR head was `1d93bbb98f5aaf7275f84d32240dee653a067e9b`.
+- [CI](https://github.com/bait-alkhadamat/hbeval-reliability-os/actions/runs/44616958226) recorded four passing jobs and one skipped newest-dependencies job. The passing jobs covered Python 3.12 tests, dependency lock consistency, static analysis and advisories, and Docker lint/build/startup including an HTTP health probe. [CodeQL](https://github.com/bait-alkhadamat/hbeval-reliability-os/actions/runs/44616958367) completed successfully.
+- Staging verification is pending. Record the Railway project, environment, service, deployment ID and source SHA. For that same deployment, capture the timestamp and database, cache and API component statuses from GET /health. The HTTP status and protocol version alone cannot identify the deployed commit or establish dependency health. Keep production source mapping open until independently verified.
