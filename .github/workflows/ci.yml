@@ -65,7 +65,7 @@ jobs:
       - run: |
           # The SDK is part of the resolution (it brings its own dependencies) but is not itself locked.
           grep -v '^#' requirements.txt | grep -v '^$' > ./lock.in
-          uv pip compile ./lock.in --python-version 3.12 --generate-hashes --no-emit-package hb-eval-sdk -o /tmp/fresh.lock
+          uv pip compile -c requirements.lock ./lock.in --python-version 3.12 --generate-hashes --no-emit-package hb-eval-sdk -o /tmp/fresh.lock
           python - <<'PY'
           import re
           pin = lambda path: {m.group(1).lower(): m.group(2) for m in re.finditer(r"^([A-Za-z0-9_.\-\[\]]+)==([0-9][^\s\\;]*)", open(path, encoding="utf-8").read(), re.M)}
@@ -99,7 +99,7 @@ jobs:
         with: {persist-credentials: false}
       - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
         with: {dockerfile: Dockerfile}
-      - run: docker build --build-arg WITH_EMBEDDINGS=0 -t hb-eval-gateway:ci .
+      - run: docker build -t hb-eval-gateway:ci .
       - name: The image starts, serves /health, advertises its protocol, and does not run as root
         run: |
           docker run -d --name gw -p 8000:8000 -e AES_KEY="$AES_KEY" hb-eval-gateway:ci

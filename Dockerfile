@@ -12,8 +12,9 @@ COPY vendor/ ./vendor/
 # Hash-pinned: a tampered or substituted package fails the build.
 RUN pip install --require-hashes -r requirements.lock
 # The SDK is installed separately so a new SDK release does not require re-locking (see requirements.lock).
-RUN (cd vendor && sha256sum -c SHA256SUMS) && pip install --no-deps ./vendor/*.whl && pip check \
- && if [ "$WITH_EMBEDDINGS" = "1" ]; then pip install -r requirements-embeddings.txt; fi
+WORKDIR /build/vendor
+RUN sha256sum -c SHA256SUMS && pip install --no-deps ./*.whl && pip check \
+ && if [ "$WITH_EMBEDDINGS" = "1" ]; then pip install -r /build/requirements-embeddings.txt && pip check; fi
 
 FROM python:3.12-slim-bookworm
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PATH="/opt/venv/bin:$PATH"
