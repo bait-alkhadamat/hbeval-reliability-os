@@ -2,7 +2,7 @@
 fastapi>=0.115,<1
 uvicorn[standard]>=0.30,<1
 python-multipart>=0.0.20
-fastapi-limiter==0.1.6
+fastapi-limiter==0.2.0
 redis>=5.0,<6
 # hb-eval-sdk 2.13 requires cryptography>=50; the previous ">=42,<44" made the two uninstallable together.
 cryptography>=50.0.0,<52
