@@ -23,6 +23,11 @@ jobs:
   test:
     name: tests (hash-locked, py3.12)
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 2s --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {persist-credentials: false}
@@ -35,6 +40,11 @@ jobs:
           (cd vendor && sha256sum -c SHA256SUMS)
           python -m pip install ./vendor/*.whl "pytest>=7" "fakeredis[lua]>=2.20"
       - run: python -m pytest -q
+
+      - name: Verify replay rejection and request limit with real Redis
+        env:
+          HB_TEST_LOOPBACK_REDIS: "1"
+        run: python -m pytest -q tests/test_e2e_sdk_gateway.py::test_real_redis_replay_and_rate_limit
 
   test-latest:
     name: tests (newest dependencies; catches upstream breakage early)

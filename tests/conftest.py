@@ -26,7 +26,10 @@ def world(monkeypatch):
     db = S.FakeSupabase(); db.add_agent(API_KEY, AGENT_AES, SIGNING)
     monkeypatch.setattr(gateway, "_supabase", db)
     monkeypatch.setattr(gateway, "_DEV_MODE", False)
-    monkeypatch.setattr(gateway.aioredis, "from_url", lambda *a, **k: _async_value(fr.FakeRedis(decode_responses=True)))
+    if os.environ.get("HB_TEST_LOOPBACK_REDIS") == "1":
+        monkeypatch.setattr(gateway, "_REDIS_URL", "redis://127.0.0.1:6379/15")
+    else:
+        monkeypatch.setattr(gateway.aioredis, "from_url", lambda *a, **k: _async_value(fr.FakeRedis(decode_responses=True)))
     monkeypatch.setattr(gateway, "_retention_loop", _idle_loop)
     with TestClient(gateway.app, base_url="https://gateway.test") as tc:
         bridge = S.Bridge(tc); monkeypatch.setattr(requests, "post", bridge)
