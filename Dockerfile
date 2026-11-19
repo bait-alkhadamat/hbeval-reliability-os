@@ -13,9 +13,11 @@ COPY vendor/ ./vendor/
 RUN pip install --require-hashes -r requirements.lock
 # The SDK is installed separately so a new SDK release does not require re-locking (see requirements.lock).
 WORKDIR /build/vendor
+# The local wheel is pinned by SHA256SUMS.
+# hadolint ignore=DL3013
 RUN sha256sum -c SHA256SUMS && pip install --no-deps ./*.whl && pip check \
  && if [ "$WITH_EMBEDDINGS" = "1" ]; then \
-      pip install --index-url https://download.pytorch.org/whl/cpu torch \
+      pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.8.0+cpu' \
       && pip install -r /build/requirements-embeddings.txt \
       && pip check \
       && python -c "from sentence_transformers import SentenceTransformer"; \
