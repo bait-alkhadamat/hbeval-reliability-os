@@ -2,6 +2,7 @@
 SDK 2.13.0 <-> Gateway, end to end, with the real client and the real application.
 See tests/e2e_support.py for exactly what is and is not replaced.
 """
+import os
 import asyncio, json, re, time
 import pytest
 import requests
@@ -244,3 +245,19 @@ def test_a_wildcard_origin_is_refused_in_production_and_listed_origins_are_not_r
     assert ok.headers.get("access-control-allow-origin") == "https://hbeval.com"
     assert "access-control-allow-origin" not in bad.headers
     sys.modules.pop("gateway", None); monkeypatch.delenv("ALLOWED_ORIGINS", raising=False)
+
+@pytest.mark.skipif(os.environ.get("HB_TEST_LOOPBACK_REDIS") != "1", reason="requires isolated Redis")
+def test_real_redis_replay_and_rate_limit(world):
+    client = world.make_client()
+    client.evaluate(dict(WITH_FAULT))
+    path, headers, body = world.bridge.calls[0]
+    duplicate = world.http.post(path, headers=headers, json=body)
+    assert duplicate.status_code == 409
+    assert "replay" in duplicate.json()["detail"].lower()
+    for _ in range(98):
+        client.evaluate(dict(WITH_FAULT))
+    nonce, ciphertext = client._encrypt(dict(WITH_FAULT))
+    headers = client._build_headers(nonce, str(int(time.time())), ciphertext)
+    limited = world.http.post(path, headers=headers, json={"ciphertext": ciphertext})
+    assert limited.status_code == 429
+    assert 0 < int(limited.headers["Retry-After"]) <= 60
