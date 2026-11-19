@@ -1,38 +1,13 @@
-# HB-Eval OS Gateway — Python dependencies (v2.1.0)
-# ==================================================
-# fastapi-limiter is PINNED to an exact version. This is the single line that
-# was blocking Railway deployment: a loose range (>=0.1.6,<1) allowed pip to
-# install a version whose internal API did not match the code's calls, so the
-# container crashed on startup before serving anything. Pinning it exactly
-# removes that failure. After any future change here, test locally first:
-#     pip install -r requirements.txt
-#     uvicorn gateway:app --reload
-
-# ── Web framework ──────────────────────────────────────────────────────────
-fastapi>=0.111,<1
+# Runtime dependencies of the Gateway. Ranges, not pins: requirements.lock is the reproducible set.
+fastapi>=0.115,<1
 uvicorn[standard]>=0.30,<1
-python-multipart>=0.0.6
-
-# ── Rate limiting (PINNED — see note above) ────────────────────────────────
+python-multipart>=0.0.20
 fastapi-limiter==0.1.6
-redis[asyncio]>=5.0,<6
-
-# ── Cryptography ───────────────────────────────────────────────────────────
-cryptography>=42,<44
-
-# ── Database ───────────────────────────────────────────────────────────────
+redis>=5.0,<6
+# hb-eval-sdk 2.13 requires cryptography>=50; the previous ">=42,<44" made the two uninstallable together.
+cryptography>=50.0.0,<52
 supabase>=2.4,<3
-
-# ── Data validation ────────────────────────────────────────────────────────
 pydantic>=2.6,<3
-
-# ── Verified path: secure outbound calls to user agent endpoints ───────────
-# Used by verified_runner.py (async HTTP with strict timeouts, no auto-redirect).
 httpx>=0.27,<1
-
-# ── EDM Layer 1: lightweight local embeddings (all-MiniLM-L6-v2, 384-dim) ───
-# CPU-only torch keeps the image far smaller than the default CUDA build —
-# important for Railway memory limits. The model (~90 MB) loads lazily on
-# first consolidation; if it can't load, the guard degrades gracefully and
-# the core evaluation is unaffected.
-sentence-transformers>=2.7,<3
+# The wire protocol, the V2 artefacts and the enforcement surface. Publish the SDK before deploying this.
+./vendor/hb_eval_sdk-2.13.0-py3-none-any.whl

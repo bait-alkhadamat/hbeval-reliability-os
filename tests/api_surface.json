@@ -1,0 +1,36 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "HB-Eval Gateway",
+    "version": "2.8.0"
+  },
+  "operations": [
+    "GET /.well-known/oauth-authorization-server",
+    "GET /.well-known/oauth-protected-resource",
+    "GET /api/v1/observatory",
+    "GET /api/v1/passport/key",
+    "GET /api/v1/passport/{agent_id}",
+    "GET /health",
+    "GET /mcp",
+    "GET /oauth/authorize",
+    "POST /api/v1/battery/preview",
+    "POST /api/v1/explain",
+    "POST /api/v1/memory/retrieve",
+    "POST /api/v1/monitoring/session",
+    "POST /api/v1/monitoring/stream",
+    "POST /api/v1/monitoring/trend",
+    "POST /api/v1/observatory/consent",
+    "POST /api/v1/passport/demo",
+    "POST /api/v1/passport/verify",
+    "POST /evaluate",
+    "POST /evaluate_battery",
+    "POST /evaluate_plain",
+    "POST /evaluate_verified",
+    "POST /mcp",
+    "POST /oauth/approve",
+    "POST /oauth/register",
+    "POST /oauth/revoke",
+    "POST /oauth/token"
+  ],
+  "note": "The public API surface with the enforcement API disabled (its default). Changing it is a deliberate API change: update this file in the same commit, and say so in CHANGELOG.md."
+}

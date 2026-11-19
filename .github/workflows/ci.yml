@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * 1'   # weekly: advisories and upstream releases arrive after a commit, not before
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A throwaway master key for the test suite only (base64 of 32 bytes). Not a secret.
+  AES_KEY: 'QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8='
+
+jobs:
+  test:
+    name: tests (hash-locked, py3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with: {python-version: '3.12'}
+      # The exact set that ships: hash-pinned, so a substituted package fails here, not in production.
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.lock
+          (cd vendor && sha256sum -c SHA256SUMS)
+          python -m pip install ./vendor/*.whl "pytest>=7" "fakeredis[lua]>=2.20"
+      - run: python -m pytest -q
+
+  test-latest:
+    name: tests (newest dependencies; catches upstream breakage early)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.13']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with: {python-version: '${{ matrix.python }}'}
+      - run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  lock-is-current:
+    name: requirements.lock matches requirements.txt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with: {python-version: '3.12'}
+      - run: python -m pip install uv
+      # Same input the maintainers use; the lock must be reproducible from requirements.txt.
+      - run: |
+          # The SDK is part of the resolution (it brings its own dependencies) but is not itself locked.
+          grep -v '^#' requirements.txt | grep -v '^$' > ./lock.in
+          uv pip compile -c requirements.lock ./lock.in --python-version 3.12 --generate-hashes --no-emit-package hb-eval-sdk -o /tmp/fresh.lock
+          python - <<'PY'
+          import re
+          pin = lambda path: {m.group(1).lower(): m.group(2) for m in re.finditer(r"^([A-Za-z0-9_.\-\[\]]+)==([0-9][^\s\\;]*)", open(path, encoding="utf-8").read(), re.M)}
+          have, fresh = pin("requirements.lock"), pin("/tmp/fresh.lock")
+          # Resolution can move forward over time; what must hold is that nothing locked is missing or removed.
+          assert set(have) == set(fresh), f"package set differs: {sorted(set(have) ^ set(fresh))}"
+          print(len(have), "locked packages; the same set re-resolves")
+          PY
+
+  security:
+    name: security (static analysis, advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with: {python-version: '3.12'}
+      - run: python -m pip install bandit pip-audit
+      # Production modules only: tests and calibration scripts legitimately use assert.
+      - run: |
+          files=()
+          for f in ./*.py; do case "$(basename "$f")" in test_*|calibration*) ;; *) files+=("$f");; esac; done
+          bandit -q -ll "${files[@]}"
+      - run: pip-audit -r requirements.lock --no-deps --disable-pip --progress-spinner off
+
+  container:
+    name: container (lint, build, run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with: {dockerfile: Dockerfile}
+      - run: docker build -t hb-eval-gateway:ci .
+      - name: The image starts, serves /health, advertises its protocol, and does not run as root
+        run: |
+          docker run -d --name gw -p 8000:8000 -e AES_KEY="$AES_KEY" hb-eval-gateway:ci
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:8000/health > /dev/null && break; sleep 1; done
+          curl -fsSi http://127.0.0.1:8000/health | tee /tmp/h.txt
+          grep -qi '^x-hbeval-protocol: 2.8.0' /tmp/h.txt
+          if grep -qi '^server:' /tmp/h.txt; then echo "Server header leaked"; exit 1; fi
+          [ "$(docker exec gw id -u)" != "0" ]
+          docker rm -f gw
