@@ -1,0 +1,3 @@
+# Optional: the EDM memory embedder (all-MiniLM-L6-v2, 384-dim). Imported lazily and best-effort: without it
+# the Gateway runs normally and episodic memory degrades to "not stored". It pulls in PyTorch (~2 GB).
+sentence-transformers>=2.7,<3

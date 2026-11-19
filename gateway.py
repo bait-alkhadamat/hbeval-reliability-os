@@ -117,11 +117,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hb-eval-gateway")
 
-# NOTE: tracks the wire protocol AND package version together (they are
-# intentionally kept in lockstep in this build). If you ever need the
-# protocol version to diverge from the SDK package version, split this
-# into PROTOCOL_VERSION and SOFTWARE_VERSION explicitly.
-PROTOCOL_VERSION = "2.7.0"
+# Fire-and-forget work (usage metering, audit log, evaluation storage) must not be fire-and-FORGET.
+# asyncio keeps only a weak reference to a task, so an unreferenced one can be garbage-collected
+# mid-flight, and an exception inside it is reported nowhere. Billing and audit records were being
+# written that way. _spawn() holds a strong reference until the task finishes and logs any failure.
+_BACKGROUND_TASKS: set = set()
+
+
+def _spawn(coro, *, name: str | None = None):
+    task = asyncio.create_task(coro, name=name)
+    _BACKGROUND_TASKS.add(task)
+
+    def _finished(t) -> None:
+        _BACKGROUND_TASKS.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.error("Background task %s failed: %r", t.get_name(), t.exception())
+
+    task.add_done_callback(_finished)
+    return task
+
+# Two protocol numbers, deliberately separate (see hb-eval-sdk docs/PROTOCOL.md §1):
+#
+#   PROTOCOL_VERSION              the WIRE protocol: which requests exist and how they are signed
+#                                 and shaped. Advertised on every response (X-HBEval-Protocol).
+#                                 2.8.0 = 2.7.0 plus the additive, opt-in enforcement surface.
+#   MEASUREMENT_PROTOCOL_VERSION  the protocol the SCORES were produced under. It is stamped into
+#                                 the measurement fingerprint of every passport, and results under
+#                                 different values are not comparable. It moves ONLY when how a
+#                                 metric is computed moves. Raising it because an endpoint was
+#                                 added would claim a measurement change that never happened, and
+#                                 would break baseline continuity for every existing agent.
+PROTOCOL_VERSION = "2.8.0"
+MEASUREMENT_PROTOCOL_VERSION = "2.7.0"
 
 
 # ── 2. Environment ──────────────────────────────────────────────────────────
@@ -139,6 +166,13 @@ _SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 _SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 _REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 _DEV_MODE = os.environ.get("DEV_MODE", "false").lower() == "true"
+
+# Until migration 15 has populated agents.api_key_hash for every agent, a key that is not found by its
+# hash is looked up by its plaintext. That keeps existing agents working, at the price of keeping
+# plaintext API keys in the database and querying them on every miss. Set to "false" as soon as every
+# agent has a hash. Default stays "true" only so this change cannot lock out existing agents; the
+# database review (R11-B) decides when it flips.
+_ALLOW_PLAINTEXT_KEY_LOOKUP = os.environ.get("ALLOW_PLAINTEXT_API_KEY_LOOKUP", "true").strip().lower() == "true"
 
 try:
     _AES_KEY = base64.b64decode(_AES_KEY_B64)
@@ -196,13 +230,22 @@ async def lifespan(_app: FastAPI):
         await FastAPILimiter.init(redis_conn)
 
         # Retention runs in-process; see the note above the loop.
-        asyncio.create_task(_retention_loop())
+        retention_task = _spawn(_retention_loop(), name="retention-loop")
         _redis = redis_conn
         logger.info("Rate limiter + nonce guard initialised.")
     except Exception as exc:
+        retention_task = None
         logger.error("Redis unavailable: %s. Proceeding without.", exc)
     yield
     logger.info("Gateway shutting down.")
+    # A redeploy must not lose the usage increments and audit rows still in flight.
+    if retention_task is not None:
+        retention_task.cancel()
+    pending = [t for t in _BACKGROUND_TASKS if t is not retention_task]
+    if pending:
+        _done, still = await asyncio.wait(pending, timeout=10)
+        if still:
+            logger.warning("Shutdown: %d background task(s) did not finish within 10 s.", len(still))
 
 
 app = FastAPI(
@@ -223,7 +266,14 @@ app = FastAPI(
 # production an unset variable yields an empty allow-list (fail-closed),
 # so a misconfiguration cannot silently open the gateway to every origin.
 _origins_raw = os.getenv("ALLOWED_ORIGINS", "").strip()
-if _origins_raw == "*":
+if _origins_raw == "*" and not _DEV_MODE:
+    # A wildcard with credentials makes Starlette REFLECT whatever Origin the caller sends, so any
+    # website could make credentialed requests. It is honoured only in DEV_MODE; in production it is
+    # a misconfiguration and is treated as an empty allow-list (fail-closed).
+    logger.error("ALLOWED_ORIGINS='*' is refused outside DEV_MODE; no cross-origin access is allowed. "
+                 "List the origins explicitly.")
+    _allowed_origins = []
+elif _origins_raw == "*":
     _allowed_origins = ["*"]
 elif _origins_raw:
     _allowed_origins = [o.strip() for o in _origins_raw.split(",") if o.strip()]
@@ -236,8 +286,131 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-HBEval-Protocol", "X-HBEval-Protocol-Warning"],
 )
 logger.info("CORS allowed origins: %s", _allowed_origins or "(none — fail-closed)")
+
+# Largest request body accepted, in bytes. An evaluation payload is a few hundred KB at the very most; an
+# unbounded body is a memory-exhaustion request that costs the caller nothing.
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", "5000000"))
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+class _BodyLimitMiddleware:
+    """Refuse oversized bodies: by Content-Length up front, and by counting bytes for chunked uploads."""
+
+    def __init__(self, app, max_bytes: int):
+        self.app, self.max_bytes = app, max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        declared = dict(scope["headers"]).get(b"content-length")
+        if declared is not None and declared.isdigit() and int(declared) > self.max_bytes:
+            return await self._refuse(send)
+        received = 0
+        started = False
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    raise _BodyTooLarge()
+            return message
+
+        async def tracking_send(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracking_send)
+        except _BodyTooLarge:
+            if not started:
+                await self._refuse(send)
+
+    async def _refuse(self, send):
+        body = b'{"detail":"Request body too large."}'
+        await send({"type": "http.response.start", "status": 413, "headers": [
+            (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
+            (b"x-hbeval-protocol", PROTOCOL_VERSION.encode())]})
+        await send({"type": "http.response.body", "body": body})
+
+
+class _SecurityHeadersMiddleware:
+    """Defence-in-depth headers on every response. This is an API: nothing it returns should be framed,
+    sniffed, cached by an intermediary, or sent onward in a Referer header."""
+
+    BASE = ((b"x-content-type-options", b"nosniff"), (b"referrer-policy", b"no-referrer"),
+            (b"cache-control", b"no-store"), (b"x-frame-options", b"DENY"),
+            (b"strict-transport-security", b"max-age=31536000; includeSubDomains"))
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                present = {k.lower() for k, _ in headers}
+                is_json = any(k.lower() == b"content-type" and v.startswith(b"application/json") for k, v in headers)
+                for k, v in self.BASE:
+                    if k not in present:
+                        headers.append((k, v))
+                if is_json and b"content-security-policy" not in present:
+                    headers.append((b"content-security-policy", b"default-src 'none'; frame-ancestors 'none'"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
+app.add_middleware(_SecurityHeadersMiddleware)
+app.add_middleware(_BodyLimitMiddleware, max_bytes=MAX_BODY_BYTES)
+
+
+def _protocol_parts(version):
+    """'2.8.0' -> (2, 8, 0); anything that is not exactly three integers -> None."""
+    if not isinstance(version, str):
+        return None
+    parts = version.strip().split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return None
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
+@app.middleware("http")
+async def _negotiate_protocol(request: Request, call_next):
+    """Advertise this Gateway's wire protocol on every response, and check the caller's.
+
+    major differs  -> 400. The two sides do not share a protocol, and answering would be guessing.
+    minor differs  -> served, with X-HBEval-Protocol-Warning, because endpoints may be missing on one side.
+    absent / unreadable -> served. Older SDKs, curl and browsers do not send it; refusing them would
+                           break every existing client for no safety gain.
+    """
+    declared = request.headers.get("X-HBEval-Protocol")
+    ours = _protocol_parts(PROTOCOL_VERSION)
+    theirs = _protocol_parts(declared) if declared is not None else None
+    advertise = {"X-HBEval-Protocol": PROTOCOL_VERSION}
+    if theirs is not None and theirs[0] != ours[0]:
+        return JSONResponse(
+            status_code=400, headers=advertise,
+            content={"detail": f"Unsupported protocol major version: client {declared}, gateway {PROTOCOL_VERSION}."})
+    response = await call_next(request)
+    response.headers["X-HBEval-Protocol"] = PROTOCOL_VERSION
+    if theirs is not None and theirs[1] != ours[1]:
+        response.headers["X-HBEval-Protocol-Warning"] = (
+            f"minor version differs: client {declared}, gateway {PROTOCOL_VERSION}")
+    return response
 
 if not _HAS_OAUTH:
     logger.warning(
@@ -297,7 +470,10 @@ def _decrypt_secret(encrypted_b64: str) -> bytes:
 async def _extract_api_key(authorization: str | None = Header(default=None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
-    return authorization[len("Bearer "):]
+    token = authorization[len("Bearer "):].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    return token
 
 
 async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, Any]:
@@ -354,6 +530,9 @@ async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, 
         try:
             result = await asyncio.to_thread(_query_by_hash)
         except Exception:
+            if not _ALLOW_PLAINTEXT_KEY_LOOKUP:
+                logger.error("api_key_hash lookup failed and the plaintext fallback is disabled.")
+                raise HTTPException(status_code=503, detail="Authentication backend unavailable.")
             # The column does not exist yet (migration 15 not applied). Fall
             # back rather than fail closed on every request during rollout.
             logger.warning(
@@ -362,7 +541,7 @@ async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, 
             )
             result = await asyncio.to_thread(_query_by_plaintext)
 
-        if not result.data:
+        if not result.data and _ALLOW_PLAINTEXT_KEY_LOOKUP:
             # Also try plaintext for rows the backfill has not reached.
             try:
                 result = await asyncio.to_thread(_query_by_plaintext)
@@ -416,9 +595,17 @@ async def verify_api_key(api_key: str = Depends(_extract_api_key)) -> dict[str, 
             "last_eval_date": row.get("last_eval_date", "2000-01-01"),
         }
     else:
-        # Development fallback only.
+        # Development fallback ONLY. This branch is reached when Supabase is not configured. In
+        # production that is a misconfiguration, and it must fail CLOSED: the fallback below uses an
+        # empty default API key and constant default secrets that anyone can read in this file, so
+        # letting it run outside DEV_MODE would let any caller authenticate (an empty bearer token
+        # matches an empty key, and the default signing and AES secrets are public).
+        if not _DEV_MODE:
+            logger.critical("Authentication backend (Supabase) is not configured and DEV_MODE is off. "
+                            "Refusing every request.")
+            raise HTTPException(status_code=503, detail="Authentication backend is not configured.")
         dev_key = os.environ.get("DEV_API_KEY", "")
-        if not hmac_module.compare_digest(api_key, dev_key):
+        if not dev_key or not hmac_module.compare_digest(api_key, dev_key):
             raise HTTPException(status_code=401, detail="Invalid API key.")
         dev_secret_b64 = os.environ.get("DEV_SIGNING_SECRET", base64.b64encode(b"d" * 32).decode())
         dev_aes_b64 = os.environ.get("DEV_AGENT_AES_KEY", base64.b64encode(b"a" * 32).decode())
@@ -869,6 +1056,15 @@ async def _probe_redis() -> tuple:
         return "degraded", type(exc).__name__
 
 
+# ── R11-C: enforcement surface (OFF unless HBEVAL_ENFORCE_API_KEY is set) ──
+try:
+    from enforcement_mount import mount as _mount_enforcement
+    ENFORCEMENT_STATUS = _mount_enforcement(app)
+except Exception as _exc:          # never take the Gateway down for this
+    ENFORCEMENT_STATUS = {"enforcement_api": "disabled", "reason": "mount error"}
+    logger.error("enforcement mount failed: %s", _exc)
+
+
 @app.get("/health", tags=["Infrastructure"])
 async def health() -> dict:
     """Service health, checked rather than asserted.
@@ -899,12 +1095,16 @@ async def health() -> dict:
 
     return {
         "status": overall,
-        "version": PROTOCOL_VERSION,
+        "version": PROTOCOL_VERSION,                      # kept for existing consumers: the wire protocol
+        "protocol_version": PROTOCOL_VERSION,
+        "measurement_protocol_version": MEASUREMENT_PROTOCOL_VERSION,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "components": {
             "database": {"status": db_state, "detail": db_detail},
             "cache": {"status": redis_state, "detail": redis_detail},
             "api": {"status": "ok", "detail": None},
+            "enforcement": {"status": ENFORCEMENT_STATUS["enforcement_api"],
+                            "detail": ENFORCEMENT_STATUS["reason"]},
         },
         # Published so the retention policy can be verified rather than taken
         # on trust.
@@ -980,9 +1180,9 @@ async def evaluate(
         result = HBEvalEngines.evaluate(payload, history)
 
         gated = _apply_plan_gates(result, plan_type)
-        asyncio.create_task(_store_evaluation(run_id, project_id, agent_id, payload, result))
+        _spawn(_store_evaluation(run_id, project_id, agent_id, payload, result))
         # Layer 1 — EDM selective storage: consolidate only if PEI>=0.8 AND TI>=4.0
-        asyncio.create_task(edm_guard.consolidate(_supabase, run_id, project_id, payload, result))
+        _spawn(edm_guard.consolidate(_supabase, run_id, project_id, payload, result))
 
         success, status_code, error_code = True, 200, None
         return {**gated, "run_id": run_id}
@@ -996,13 +1196,13 @@ async def evaluate(
     finally:
         latency_ms = int((time.monotonic() - start_time) * 1000)
         ip_raw = http_request.client.host if http_request.client else None
-        asyncio.create_task(_audit_log(
+        _spawn(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/evaluate", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
         if success:
-            asyncio.create_task(_increment_usage(auth.get("user_id")))
+            _spawn(_increment_usage(auth.get("user_id")))
 
 
 @app.post("/evaluate_battery", tags=["Evaluation"])
@@ -1114,9 +1314,9 @@ async def evaluate_battery(
             report["battery_spec_mismatch"] = None
 
         gated = _apply_plan_gates(report, plan_type)
-        asyncio.create_task(_store_evaluation(run_id, project_id, agent_id, payload, report))
+        _spawn(_store_evaluation(run_id, project_id, agent_id, payload, report))
         # EDM consolidation uses the aggregate report (high-quality episodes).
-        asyncio.create_task(edm_guard.consolidate(_supabase, run_id, project_id, payload, report))
+        _spawn(edm_guard.consolidate(_supabase, run_id, project_id, payload, report))
 
         success, status_code, error_code = True, 200, None
         return {**gated, "run_id": run_id}
@@ -1130,13 +1330,13 @@ async def evaluate_battery(
     finally:
         latency_ms = int((time.monotonic() - start_time) * 1000)
         ip_raw = http_request.client.host if http_request.client else None
-        asyncio.create_task(_audit_log(
+        _spawn(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/evaluate_battery", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
         if success:
-            asyncio.create_task(_increment_usage(auth.get("user_id"), billable_units))
+            _spawn(_increment_usage(auth.get("user_id"), billable_units))
 
 
 
@@ -1275,8 +1475,8 @@ async def evaluate_verified(
 
         agent_id = payload.get("agent_id", "verified-agent")
         gated = _apply_plan_gates(report, plan_type)
-        asyncio.create_task(_store_evaluation(run_id, project_id, agent_id, payload, report))
-        asyncio.create_task(edm_guard.consolidate(_supabase, run_id, project_id, payload, report))
+        _spawn(_store_evaluation(run_id, project_id, agent_id, payload, report))
+        _spawn(edm_guard.consolidate(_supabase, run_id, project_id, payload, report))
 
         success, status_code, error_code = True, 200, None
 
@@ -1321,13 +1521,13 @@ async def evaluate_verified(
                 pass
         latency_ms = int((time.monotonic() - start_time) * 1000)
         ip_raw = http_request.client.host if http_request.client else None
-        asyncio.create_task(_audit_log(
+        _spawn(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/evaluate_verified", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
         if success:
-            asyncio.create_task(_increment_usage(auth.get("user_id"), billable_units))
+            _spawn(_increment_usage(auth.get("user_id"), billable_units))
 
 
 @app.post("/evaluate_plain", tags=["Evaluation"])
@@ -1363,8 +1563,8 @@ async def evaluate_plain(
         history = await _fetch_history(project_id, agent_id)
         result = HBEvalEngines.evaluate(payload, history)
         gated = _apply_plan_gates(result, plan_type)
-        asyncio.create_task(_store_evaluation(run_id, project_id, agent_id, payload, result))
-        asyncio.create_task(edm_guard.consolidate(_supabase, run_id, project_id, payload, result))
+        _spawn(_store_evaluation(run_id, project_id, agent_id, payload, result))
+        _spawn(edm_guard.consolidate(_supabase, run_id, project_id, payload, result))
         success, status_code, error_code = True, 200, None
         return {**gated, "run_id": run_id}
     except HTTPException:
@@ -1376,13 +1576,13 @@ async def evaluate_plain(
     finally:
         latency_ms = int((time.monotonic() - start_time) * 1000)
         ip_raw = http_request.client.host if http_request.client else None
-        asyncio.create_task(_audit_log(
+        _spawn(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/evaluate_plain", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
         ))
         if success:
-            asyncio.create_task(_increment_usage(auth.get("user_id")))
+            _spawn(_increment_usage(auth.get("user_id")))
 
 
 @app.post("/api/v1/memory/retrieve", tags=["Memory"])
@@ -1441,7 +1641,7 @@ async def memory_retrieve(
     finally:
         latency_ms = int((time.monotonic() - start_time) * 1000)
         ip_raw = http_request.client.host if http_request.client else None
-        asyncio.create_task(_audit_log(
+        _spawn(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/api/v1/memory/retrieve", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
@@ -1501,7 +1701,7 @@ async def explain(
     finally:
         latency_ms = int((time.monotonic() - start_time) * 1000)
         ip_raw = http_request.client.host if http_request.client else None
-        asyncio.create_task(_audit_log(
+        _spawn(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/api/v1/explain", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
@@ -1770,7 +1970,7 @@ async def monitoring_session(
         # hide the more important one.
         if _HAS_ALERTS and summary.get("halted"):
             record = summary.get("halt_record") or {}
-            asyncio.create_task(alerts_lib.dispatch(
+            _spawn(alerts_lib.dispatch(
                 _supabase, asyncio.to_thread, ssrf_guard,
                 user_id=auth.get("user_id"),
                 event={
@@ -1789,7 +1989,7 @@ async def monitoring_session(
         # Fired as a background task: the user's own session is already
         # stored, and a slow or failing contribution must not delay their
         # response.
-        asyncio.create_task(_contribute_to_observatory(auth.get("user_id"), summary))
+        _spawn(_contribute_to_observatory(auth.get("user_id"), summary))
 
         status_code, error_code = 200, None
         return {"stored": True, "session_id": summary.get("session_id"), "run_id": run_id}
@@ -1803,7 +2003,7 @@ async def monitoring_session(
     finally:
         latency_ms = int((time.monotonic() - start_time) * 1000)
         ip_raw = http_request.client.host if http_request.client else None
-        asyncio.create_task(_audit_log(
+        _spawn(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/api/v1/monitoring/session", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
@@ -1948,7 +2148,7 @@ async def _apply_monitoring_batch(user_id: str | None, batch: dict) -> None:
     # breaching on twenty consecutive steps produces one notification.
     if _HAS_ALERTS and user_id:
         for e in rows:
-            asyncio.create_task(alerts_lib.dispatch(
+            _spawn(alerts_lib.dispatch(
                 _supabase, asyncio.to_thread, ssrf_guard,
                 user_id=user_id,
                 event={
@@ -2295,7 +2495,7 @@ async def get_passport(
             user_id=auth.get("user_id"),
             window_days=window,
             battery_fingerprint=fingerprint,
-            protocol_version=PROTOCOL_VERSION,
+            protocol_version=MEASUREMENT_PROTOCOL_VERSION,
         )
     except PermissionError:
         # Same response whether the agent belongs to someone else or does not
@@ -2384,7 +2584,7 @@ async def demo_passport(
         "issuer": {
             "name": "HB-Eval",
             "url": "https://hbeval.com",
-            "protocol_version": PROTOCOL_VERSION,
+            "protocol_version": MEASUREMENT_PROTOCOL_VERSION,
             "issued_by": "HB-Eval",
             "statement": (
                 "DEMONSTRATION PASSPORT. This records a scripted demo run on "
@@ -2439,7 +2639,7 @@ async def demo_passport(
 
         "measurement": {
             "fingerprint": passport_lib.measurement_fingerprint(
-                protocol_version=PROTOCOL_VERSION, battery_spec=fingerprint),
+                protocol_version=MEASUREMENT_PROTOCOL_VERSION, battery_spec=fingerprint),
             "battery_spec_fingerprint": fingerprint,
             "monitoring_overhead_p50_ms": None,
             "monitoring_overhead_p99_ms": None,
@@ -2579,7 +2779,7 @@ async def observatory_consent(
     finally:
         latency_ms = int((time.monotonic() - start_time) * 1000)
         ip_raw = http_request.client.host if http_request.client else None
-        asyncio.create_task(_audit_log(
+        _spawn(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/api/v1/observatory/consent", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
@@ -2657,7 +2857,7 @@ async def monitoring_stream(
     finally:
         latency_ms = int((time.monotonic() - start_time) * 1000)
         ip_raw = http_request.client.host if http_request.client else None
-        asyncio.create_task(_audit_log(
+        _spawn(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/api/v1/monitoring/stream", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
@@ -2825,7 +3025,7 @@ async def monitoring_trend(
     finally:
         latency_ms = int((time.monotonic() - start_time) * 1000)
         ip_raw = http_request.client.host if http_request.client else None
-        asyncio.create_task(_audit_log(
+        _spawn(_audit_log(
             project_id=project_id, api_key_hash=api_key_hash,
             endpoint="/api/v1/monitoring/trend", method="POST", status_code=status_code,
             request_id=run_id, error_code=error_code, latency_ms=latency_ms, ip_raw=ip_raw,
@@ -3354,7 +3554,7 @@ async def mcp_endpoint(
         # successful one leaves a real cost invisible to every quota and
         # billing system on the platform, which is what happened before.
         if units > 0 and not is_error:
-            asyncio.create_task(_increment_usage(ctx["user_id"], units))
+            _spawn(_increment_usage(ctx["user_id"], units))
 
         return ok({"content": [{"type": "text", "text": result}],
                    "isError": is_error})

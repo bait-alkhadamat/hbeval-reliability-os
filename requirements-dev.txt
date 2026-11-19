@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=7
+fakeredis[lua]>=2.20
+bandit
+pip-audit
