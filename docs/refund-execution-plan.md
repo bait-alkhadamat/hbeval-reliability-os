@@ -24,3 +24,5 @@ Local reproduction: Python 3.12.14, SQLite 3.53.1, pytest 9.2.0. From repository
 أفاد المالك بحفظ مفتاح Stripe الاختباري في أسرار GitHub. أضيف مدخل sandbox_charge للتشغيل اليدوي على فرع التجربة في d3e1052. المتبقي معرّف دفعة اختبارية مخصصة ثم تشغيل المطابقة. لم يُتحقق من المفتاح لدى Stripe بعد.
 
 تحديث: وصل معرّف PaymentIntent وأضيف دعم استخراج latest_charge في 2591883. التحقق الخارجي معلق على التشغيل اليدوي لفرع التجربة بمدخل sandbox_charge. فحص pull_request يتخطى خطوة Stripe الخارجية.
+
+التحقق من [CI #36](https://github.com/bait-alkhadamat/hbeval-reliability-os/actions/runs/44722272672/job/136240873031): نجح CI، وكانت خطوة Stripe الخارجية skipped. لا يوجد إيصال خارجي من هذا التشغيل. التالي تشغيل CI يدويًا على فرع التجربة مع sandbox_charge.
