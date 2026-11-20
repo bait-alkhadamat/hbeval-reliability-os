@@ -69,7 +69,7 @@ def test_stripe_worker_restart(tmp_path):
                                    "description": "Sandbox worker recovery experiment"})
         if response.is_error:
             error = response.json()["error"]
-            pytest.fail(f"Sandbox setup: {error.get(\x27code\x27)} {error.get(\x27message\x27)}")
+            pytest.fail(f"Sandbox setup: {error.get('code')} {error.get('message')}")
         intent = response.json()
         assert intent["livemode"] is False and intent["status"] == "succeeded"
         charge = intent["latest_charge"]
