@@ -65,7 +65,7 @@ def test_stripe_worker_restart(tmp_path):
     with client() as stripe:
         response = stripe.post("/v1/payment_intents", headers={"Idempotency-Key": uuid.uuid4().hex},
                              data={"amount": "200", "currency": "usd", "payment_method": "pm_card_visa",
-                                   "payment_method_types[]": "card", "confirm": "true",
+                                   "return_url": "https://example.com/stripe-test-return", "confirm": "true",
                                    "description": "Sandbox worker recovery experiment"})
         if response.is_error:
             error = response.json()["error"]
