@@ -6,6 +6,11 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      stripe_worker_recovery:
+        description: Create a dedicated sandbox payment and verify automatic worker recovery
+        required: false
+        type: boolean
+        default: false
       sandbox_charge:
         description: Dedicated unrefunded USD Stripe test charge (optional)
         required: false
@@ -45,6 +50,13 @@ jobs:
           (cd vendor && sha256sum -c SHA256SUMS)
           python -m pip install ./vendor/*.whl "pytest>=7" "fakeredis[lua]>=2.20"
       - run: python -m pytest -q
+
+      - name: Recover automatically after Stripe accepts a sandbox refund
+        if: github.ref == 'refs/heads/main' && ((github.event_name == 'workflow_dispatch' && inputs.stripe_worker_recovery) || (github.event_name == 'push' && contains(github.event.head_commit.message, '[verify-stripe-worker]')))
+        env:
+          STRIPE_TEST_SECRET_KEY: ${{ secrets.STRIPE_TEST_SECRET_KEY }}
+          HB_STRIPE_RESTART_TEST: "1"
+        run: python -m pytest -q -s --tb=short tests/test_stripe_worker_recovery.py
 
       - name: Verify Stripe sandbox refund against provider records
         if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/experiment/refund-effect-evidence' && inputs.sandbox_charge != ''
