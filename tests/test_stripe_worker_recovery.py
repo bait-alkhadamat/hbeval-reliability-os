@@ -63,9 +63,14 @@ def test_stripe_worker_restart(tmp_path):
     if os.getenv("HB_STRIPE_RESTART_TEST") != "1":
         pytest.skip("Dedicated sandbox experiment")
     with client() as stripe:
-        intent = stripe.post("/v1/payment_intents", headers={"Idempotency-Key": uuid.uuid4().hex},
+        response = stripe.post("/v1/payment_intents", headers={"Idempotency-Key": uuid.uuid4().hex},
                              data={"amount": "200", "currency": "usd", "payment_method": "pm_card_visa",
-                                   "payment_method_types[]": "card", "confirm": "true"}).raise_for_status().json()
+                                   "payment_method_types[]": "card", "confirm": "true",
+                                   "description": "Sandbox worker recovery experiment"})
+        if response.is_error:
+            error = response.json()["error"]
+            pytest.fail(f"Sandbox setup: {error.get(\x27code\x27)} {error.get(\x27message\x27)}")
+        intent = response.json()
         assert intent["livemode"] is False and intent["status"] == "succeeded"
         charge = intent["latest_charge"]
         op = hashlib.sha256(f"hb-restart:{charge}".encode()).hexdigest()
