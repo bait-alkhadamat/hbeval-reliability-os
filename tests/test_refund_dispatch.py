@@ -154,3 +154,53 @@ def test_dispatch(tmp_path, policy, scenario):
         assert result == attempts[0][0] == effects[0][0]
     elif scenario == "conflict" and policy != "raw" or scenario == "new_key" and blocked:
         assert result == "CONFLICT"
+
+
+def test_delayed_receipt(tmp_path):
+    from refund_recovery import ProviderReceipt, recover_refund
+
+    initialize(tmp_path)
+    action = Refund("a", "refund-1", "pay-1", 3500, "USD")
+    receipt = dispatch(tmp_path, action, "key", "gateway")
+    states = []
+    for tick in range(4):
+        def lookup(request):
+            with sqlite3.connect(tmp_path / "provider") as db:
+                rows = db.execute("SELECT receipt,payload FROM effects WHERE tenant=? AND op=?",
+                                  (request.tenant, request.operation_id)).fetchall()
+            return [ProviderReceipt(action, ref, True) for ref, payload in rows
+                    if tick >= 3 and payload == digest(action)]
+        states.append(recover_refund(action, lookup, now=tick, protected_until=10))
+        with sqlite3.connect(tmp_path / "provider") as db:
+            assert db.execute("SELECT COUNT(*) FROM attempts").fetchone() == (1,)
+    assert states == [("UNKNOWN", None)] * 3 + [("CONFIRMED", receipt)]
+
+
+@pytest.mark.parametrize("now,expected_attempts", [(9, 2), (10, 1), (11, 1)])
+def test_key_expiry(tmp_path, now, expected_attempts):
+    from refund_recovery import recover_refund
+
+    initialize(tmp_path)
+    action = Refund("a", "refund-1", "pay-1", 3500, "USD")
+    dispatch(tmp_path, action, "k", "gateway")
+    def retry(request):
+        dispatch(tmp_path, request, "k", "gateway", protected=now < 10)
+    assert recover_refund(action, lambda _: [], now=now, protected_until=10,
+                          retry=retry) == ("UNKNOWN", None)
+    with sqlite3.connect(tmp_path / "provider") as db:
+        assert db.execute("SELECT COUNT(*) FROM attempts").fetchone() == (expected_attempts,)
+        assert db.execute("SELECT COUNT(*) FROM effects").fetchone() == (1,)
+
+
+def test_currency_conflict_and_tenant_isolation(tmp_path):
+    initialize(tmp_path)
+    a = Refund("a", "same-ref", "pay-a", 3500, "USD")
+    b = replace(a, tenant="b", payment_id="pay-b", currency="EUR")
+    first = dispatch(tmp_path, a, "same-key", "gateway")
+    assert dispatch(tmp_path, replace(a, currency="EUR"), "same-key", "gateway") == "CONFLICT"
+    second = dispatch(tmp_path, b, "same-key", "gateway")
+    assert first != second
+    with sqlite3.connect(tmp_path / "provider") as db:
+        assert db.execute("SELECT tenant,currency,receipt FROM effects ORDER BY tenant").fetchall() == [
+            ("a", "USD", first), ("b", "EUR", second)]
+        assert db.execute("SELECT COUNT(*) FROM attempts").fetchone() == (2,)
