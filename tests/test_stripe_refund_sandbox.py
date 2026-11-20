@@ -53,8 +53,14 @@ def test_stripe_sandbox(world):
     charge = os.getenv("HB_REFUND_TEST_CHARGE")
     if not key or not charge:
         pytest.skip("Stripe test credentials and dedicated charge required")
-    assert key.startswith(("sk_test_", "rk_test_")) and re.fullmatch(r"ch_[A-Za-z0-9]+", charge)
+    assert key.startswith(("sk_test_", "rk_test_")) and re.fullmatch(r"(ch|pi)_[A-Za-z0-9]+", charge)
     with httpx.Client(base_url="https://api.stripe.com", auth=(key, ""), timeout=15) as stripe:
+        if charge.startswith("pi_"):
+            intent = stripe.get(f"/v1/payment_intents/{charge}").raise_for_status().json()
+            assert intent["id"] == charge and intent["livemode"] is False
+            assert intent["status"] == "succeeded" and intent["currency"] == "usd"
+            charge = intent["latest_charge"]
+            assert isinstance(charge, str) and re.fullmatch(r"ch_[A-Za-z0-9]+", charge)
         exercise(world, stripe, charge)
 
 
