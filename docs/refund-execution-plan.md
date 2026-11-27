@@ -1,5 +1,17 @@
 # HB-Eval V2 | خطة التنفيذ وسجل الأدلة
 
+## 27 نوفمبر 2026 — أول قياس للحالات المحجوزة
+
+ثُبّتت [ملفات التجربة](https://github.com/bait-alkhadamat/hbeval-reliability-os/commit/6f17845ccedb1743e975052c214ccd4779d8a9d1) قبل التنفيذ، بعد [التسجيل المسبق](https://github.com/bait-alkhadamat/hbeval-reliability-os/pull/23). المرشح هو تنفيذ 0683e45 نفسه دون ضبط. SHA-256 لملف الاختبار: `f1716c973c1f910d8e7154278d2a9dfb66e0f81a1153dc24687671ca5c545fa5`. في مجلد معزول باستخدام Python 3.12.14: `python -m unittest discover -s tests -p test_registered_cases.py -v`. نجح اختبار واحد بثماني مقارنات. صفر فشل وصفر تخطٍ.
+
+| المتوقع / المرصود | APPLIES | RETEST | UNKNOWN |
+|---|---:|---:|---:|
+| APPLIES | 2 | 0 | 0 |
+| RETEST | 0 | 3 | 0 |
+| UNKNOWN | 0 | 0 | 3 |
+
+قبول دليل قديم أو غير كافٍ 0/6. إعادة اختبار غير لازمة 0/2. خلط RETEST وUNKNOWN يساوي 0/6. سجل الأداة في هذه التجربة مدخل اصطناعي منفصل. هذه الحالات أصبحت مكشوفة ويجب حجز حالات جديدة لأي ضبط لاحق.
+
 ## دفعة 26 نوفمبر 2026 — ربط المصادر وتسجيل التقييم قبل الضبط
 
 أعاد [نشر Vercel](https://vercel.com/hb-evalsystems-projects/hbeval-platform/2itKZpKRPTUbKpkDMT2g5FxdMkvZ) حالة READY والنسخة [7af8230](https://github.com/hb-evalSystem/hbeval-platform/commit/7af8230999a4156bc9caaf96eb12d5c55af8c985). أعادت [صفحة الدخول](https://www.hbeval.com/login) وحزمتها المشار إليها [page-f61b99083dafe00c.js](https://www.hbeval.com/_next/static/chunks/app/login/page-f61b99083dafe00c.js) حالة HTTP 200. طابق مضيف Supabase في الحزمة عنوان API الذي أعاده [مشروع Supabase](https://supabase.com/dashboard/project/rpxcndjxcmukkzmutytp). يثبت ذلك إعداد العميل المنشور.
